@@ -22,3 +22,12 @@ pub mod nci {
 
     include!(concat!(env!("OUT_DIR"), "/nci_packets.rs"));
 }
+
+/// RF packet parser and serializer.
+pub mod rf {
+    #![allow(clippy::all)]
+    #![allow(unused)]
+    #![allow(missing_docs)]
+
+    include!(concat!(env!("OUT_DIR"), "/rf_packets.rs"));
+}

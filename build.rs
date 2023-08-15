@@ -25,6 +25,12 @@ fn main() {
         "NCI_PACKETS_PREBUILT",
         &PathBuf::from("src/nci_packets.pdl").canonicalize().unwrap(),
     );
+
+    install_generated_module(
+        "rf_packets.rs",
+        "RF_PACKETS_PREBUILT",
+        &PathBuf::from("src/rf_packets.pdl").canonicalize().unwrap(),
+    );
 }
 
 fn install_generated_module(module_name: &str, prebuilt_var: &str, pdl_name: &PathBuf) {
