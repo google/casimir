@@ -14,8 +14,8 @@
 
 //! Implementation of the NFCC.
 
-use crate::packets::nci;
 use crate::packets::nci::Packet;
+use crate::packets::{nci, rf};
 use crate::NciReader;
 use crate::NciWriter;
 use anyhow::Result;
@@ -52,20 +52,16 @@ pub struct State {
 /// State of an NFCC instance.
 pub struct Controller {
     #[allow(dead_code)]
-    id: usize,
+    id: u16,
     nci_writer: NciWriter,
     #[allow(dead_code)]
-    rf_tx: mpsc::Sender<(usize, Vec<u8>)>,
+    rf_tx: mpsc::Sender<rf::RfPacket>,
     state: Mutex<State>,
 }
 
 impl Controller {
     /// Create a new NFCC instance with default configuration.
-    pub fn new(
-        id: usize,
-        nci_writer: NciWriter,
-        rf_tx: mpsc::Sender<(usize, Vec<u8>)>,
-    ) -> Controller {
+    pub fn new(id: u16, nci_writer: NciWriter, rf_tx: mpsc::Sender<rf::RfPacket>) -> Controller {
         Controller {
             id,
             nci_writer,
@@ -88,8 +84,8 @@ impl Controller {
     }
 
     #[allow(dead_code)]
-    async fn send_rf(&self, packet: Vec<u8>) -> Result<()> {
-        self.rf_tx.send((self.id, packet)).await?;
+    async fn send_rf(&self, packet: rf::RfPacket) -> Result<()> {
+        self.rf_tx.send(packet).await?;
         Ok(())
     }
 
@@ -460,11 +456,11 @@ impl Controller {
         }
     }
 
-    async fn receive_data(&self, _packet: nci::DataPacket) {
+    async fn receive_data(&self, _packet: nci::DataPacket) -> Result<()> {
         todo!()
     }
 
-    async fn receive_rf(&self, _packet: Vec<u8>) -> Result<()> {
+    async fn receive_rf(&self, _packet: rf::RfPacket) -> Result<()> {
         todo!()
     }
 
@@ -476,11 +472,11 @@ impl Controller {
 
     /// Main NFCC instance routine.
     pub async fn run(
-        id: usize,
+        id: u16,
         nci_reader: NciReader,
         nci_writer: NciWriter,
-        mut rf_rx: mpsc::Receiver<Vec<u8>>,
-        rf_tx: mpsc::Sender<(usize, Vec<u8>)>,
+        mut rf_rx: mpsc::Receiver<rf::RfPacket>,
+        rf_tx: mpsc::Sender<rf::RfPacket>,
     ) -> Result<()> {
         // Local controller state.
         let nfcc = Controller::new(id, nci_writer, rf_tx);
@@ -506,7 +502,7 @@ impl Controller {
                     let header = nci::PacketHeader::parse(&packet[0..3])?;
                     match header.get_mt() {
                         nci::MessageType::Data => {
-                            nfcc.receive_data(nci::DataPacket::parse(&packet)?).await
+                            nfcc.receive_data(nci::DataPacket::parse(&packet)?).await?
                         }
                         nci::MessageType::Command => {
                             nfcc.receive_command(nci::ControlPacket::parse(&packet)?).await?

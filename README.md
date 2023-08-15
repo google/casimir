@@ -22,11 +22,12 @@ cargo install pdl-compiler
 
 ```
 $ cargo run -- --help
-Usage: casimir [--nci-port <nci-port>]
+Usage: casimir [--nci-port <nci-port>] [--rf-port <rf-port>]
 
 Nfc emulator.
 
 Options:
   --nci-port        configure the TCP port for the NCI server.
+  --rf-port         configure the TCP port for the RF server.
   --help            display usage information
 ```
