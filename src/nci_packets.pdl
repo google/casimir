@@ -1,5 +1,8 @@
 little_endian_packets
 
+/// Packet specification for [NCI] NFC Controller Interface Technical
+/// Specification Version 2.2
+
 enum PacketBoundaryFlag : 1 {
   COMPLETE_OR_FINAL = 0,
   INCOMPLETE = 1,
@@ -534,6 +537,127 @@ packet RfDiscoverNotification : RfPacket (mt = NOTIFICATION, oid = DISCOVER) {
   _size_(rf_technology_specific_parameters) : 8,
   rf_technology_specific_parameters : 8[],
   notification_type : DiscoverNotificationType,
+}
+
+/// [NCI] Table 68: Specific Parameters for NFC-A Poll Mode
+packet NfcAPollModeTechnologySpecificParameters {
+  sens_res : 16,
+  _size_(nfcid1) : 8,
+  nfcid1 : 8[],
+  _fixed_ = 1 : 8,
+  sel_res : 8,
+  _fixed_ = 0 : 8,
+}
+
+/// [NCI] Table 69: Specific Parameters for NFC-A Listen Mode
+packet NfcAListenModeTechnologySpecificParameters {
+}
+
+/// [NCI] Table 70: Specific Parameters for NFC-B Poll Mode
+packet NfcBPollModeTechnologySpecificParameters {
+  _size_(sensb_res) : 8,
+  sensb_res : 8[],
+}
+
+/// [NCI] Table 71: Specific Parameters for NFC-B Listen Mode
+packet NfcBListenModeTechnologySpecificParameters {
+  sensb_cmd : 8,
+}
+
+/// [NCI] Table 72: Specific Parameters for NFC-F Poll Mode
+packet NfcFPollModeTechnologySpecificParameters {
+  bit_rate : 8,
+  _size_(sensf_res) : 8,
+  sensf_res : 8[],
+}
+
+/// [NCI] Table 73: Specific Parameters for NFC-F Listen Mode
+packet NfcFListenModeTechnologySpecificParameters {
+  _size_(local_nfcid2) : 8,
+  local_nfcid2 : 8[],
+}
+
+/// [NCI] Table 74: Specific Parameters for NFC-V Poll Mode
+packet NfcVPollModeTechnologySpecificParameters {
+  res_flag : 8,
+  dsfid : 8,
+  uid : 8[8],
+}
+
+/// [NCI] Table 77: Control Messages to select a Discovered Target
+packet RfDiscoverSelectCommand : RfPacket (mt = COMMAND, oid = DISCOVER_SELECT) {
+  rf_discovery_id : 8,
+  rf_protocol : RfProtocolType,
+  rf_interface : RfInterfaceType,
+}
+
+/// [NCI] Table 77: Control Messages to select a Discovered Target
+packet RfDiscoverSelectResponse : RfPacket (mt = RESPONSE, oid = DISCOVER_SELECT) {
+  status : Status,
+}
+
+enum BitRate : 8 {
+  BIT_RATE_106_KBIT_S = 0x00,
+  BIT_RATE_212_KBIT_S = 0x01,
+  BIT_RATE_424_KBIT_S = 0x02,
+  BIT_RATE_848_KBIT_S = 0x03,
+  BIT_RATE_1695_KBIT_S = 0x04,
+  BIT_RATE_3390_KBIT_S = 0x05,
+  BIT_RATE_6780_KBIT_S = 0x06,
+  BIT_RATE_26_KBIT_S = 0x20,
+}
+
+packet RfIntfActivatedNotification : RfPacket (mt = NOTIFICATION, oid = INTF_ACTIVATED) {
+  rf_discovery_id : 8,
+  rf_interface : RfInterfaceType,
+  rf_protocol : RfProtocolType,
+  activation_rf_technology_and_mode : RfTechnologyAndMode,
+  max_data_packet_payload_size : 8,
+  initial_number_of_credits : 8,
+  _size_(rf_technology_specific_parameters) : 8,
+  rf_technology_specific_parameters : 8[],
+  data_exchange_rf_technology_and_mode : RfTechnologyAndMode,
+  data_exchange_transmit_bit_rate : BitRate,
+  data_exchange_receive_bit_rate : BitRate,
+  _size_(activation_parameters) : 8,
+  activation_parameters : 8[],
+}
+
+/// [NCI] Table 95: Activation Parameters for NFC-A/ISO-DEP Poll Mode
+packet NfcAIsoDepPollModeActivationParameters {
+  _size_(rats_response) : 8,
+  rats_response : 8[],
+}
+
+/// [NCI] Table 96: Activation Parameters for NFC-B/ISO-DEP Poll Mode
+packet NfcBIsoDepPollModeActivationParameters {
+  _size_(attrib_response) : 8,
+  attrib_response : 8[],
+}
+
+/// [NCI] Table 98: Activation Parameters for NFC-A/ISO-DEP Listen Mode
+packet NfcAIsoDepListenModeActivationParameters {
+  param : 8,
+}
+
+/// [NCI] Table 99: Activation Parameters for NFC-B/ISO-DEP Listen Mode
+packet NfcBIsoDepListenModeActivationParameters {
+  _size_(attrib_command) : 8,
+  attrib_command : 8[],
+}
+
+/// [NCI] Table 102: Activation Parameters for NFC-DEP Poll Mode
+packet NfcDepPollModeActivationParameters {
+  _size_(atr_res) : 8,
+  atr_res : 8[],
+  data_exchange_length_reduction : 8,
+}
+
+/// [NCI] Table 103: Activation Parameters for NFC-DEP Listen Mode
+packet NfcDepListenModeActivationParameters {
+  _size_(atr_req) : 8,
+  atr_req : 8[],
+  data_exchange_length_reduction : 8,
 }
 
 enum DeactivationType : 8 {
