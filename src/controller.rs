@@ -22,8 +22,8 @@ use anyhow::Result;
 use core::time::Duration;
 use std::collections::HashMap;
 use std::convert::TryFrom;
-use tokio::select;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio::time;
 
 const NCI_VERSION: nci::NciVersion = nci::NciVersion::Version11;
@@ -34,60 +34,64 @@ const MAX_DATA_PACKET_PAYLOAD_SIZE: u8 = 255;
 const NUMBER_OF_CREDITS: u8 = 0;
 const MAX_NFCV_RF_FRAME_SIZE: u16 = 512;
 
+/// State of an NFCC logical connection with the DH.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum LogicalConnection {
+#[allow(missing_docs)]
+pub enum LogicalConnection {
     RemoteNfcEndpoint { rf_discovery_id: u8, rf_protocol_type: nci::RfProtocolType },
+}
+
+/// State of an NFCC instance.
+#[allow(missing_docs)]
+pub struct State {
+    pub config_parameters: HashMap<nci::ConfigParameterId, Vec<u8>>,
+    pub logical_connections: [Option<LogicalConnection>; MAX_LOGICAL_CONNECTIONS as usize],
 }
 
 /// State of an NFCC instance.
 pub struct Controller {
     #[allow(dead_code)]
     id: usize,
-    nci_reader: NciReader,
     nci_writer: NciWriter,
-    rf_rx: mpsc::Receiver<Vec<u8>>,
     #[allow(dead_code)]
     rf_tx: mpsc::Sender<(usize, Vec<u8>)>,
-    config_parameters: HashMap<nci::ConfigParameterId, Vec<u8>>,
-    logical_connections: [Option<LogicalConnection>; MAX_LOGICAL_CONNECTIONS as usize],
+    state: Mutex<State>,
 }
 
 impl Controller {
     /// Create a new NFCC instance with default configuration.
     pub fn new(
         id: usize,
-        nci_reader: NciReader,
         nci_writer: NciWriter,
-        rf_rx: mpsc::Receiver<Vec<u8>>,
         rf_tx: mpsc::Sender<(usize, Vec<u8>)>,
     ) -> Controller {
         Controller {
             id,
-            nci_reader,
             nci_writer,
-            rf_rx,
             rf_tx,
-            config_parameters: HashMap::new(),
-            logical_connections: [None; MAX_LOGICAL_CONNECTIONS as usize],
+            state: Mutex::new(State {
+                config_parameters: HashMap::new(),
+                logical_connections: [None; MAX_LOGICAL_CONNECTIONS as usize],
+            }),
         }
     }
 
-    async fn send_control(&mut self, packet: impl Into<nci::ControlPacket>) -> Result<()> {
+    async fn send_control(&self, packet: impl Into<nci::ControlPacket>) -> Result<()> {
         self.nci_writer.write(&packet.into().to_vec()).await
     }
 
     #[allow(dead_code)]
-    async fn send_data(&mut self, packet: impl Into<nci::DataPacket>) -> Result<()> {
+    async fn send_data(&self, packet: impl Into<nci::DataPacket>) -> Result<()> {
         self.nci_writer.write(&packet.into().to_vec()).await
     }
 
     #[allow(dead_code)]
-    async fn send_rf(&mut self, packet: Vec<u8>) -> Result<()> {
+    async fn send_rf(&self, packet: Vec<u8>) -> Result<()> {
         self.rf_tx.send((self.id, packet)).await?;
         Ok(())
     }
 
-    async fn core_reset(&mut self, cmd: nci::CoreResetCommand) -> Result<()> {
+    async fn core_reset(&self, cmd: nci::CoreResetCommand) -> Result<()> {
         println!("+ core_reset_cmd({:?})", cmd.get_reset_type());
 
         self.send_control(nci::CoreResetResponseBuilder { status: nci::Status::Ok }).await?;
@@ -107,7 +111,7 @@ impl Controller {
         Ok(())
     }
 
-    async fn core_init(&mut self, _cmd: nci::CoreInitCommand) -> Result<()> {
+    async fn core_init(&self, _cmd: nci::CoreInitCommand) -> Result<()> {
         println!("+ core_init_cmd()");
 
         self.send_control(nci::CoreInitResponseBuilder {
@@ -145,15 +149,16 @@ impl Controller {
         Ok(())
     }
 
-    async fn core_set_config(&mut self, cmd: nci::CoreSetConfigCommand) -> Result<()> {
+    async fn core_set_config(&self, cmd: nci::CoreSetConfigCommand) -> Result<()> {
         println!("+ core_set_config_cmd()");
 
+        let mut state = self.state.lock().await;
         let mut invalid_parameters = vec![];
         for parameter in cmd.get_parameters().iter() {
             match parameter.id {
                 nci::ConfigParameterId::Rfu(_) => invalid_parameters.push(parameter.id),
                 _ => {
-                    self.config_parameters.insert(parameter.id, parameter.value.clone());
+                    state.config_parameters.insert(parameter.id, parameter.value.clone());
                 }
             }
         }
@@ -182,13 +187,14 @@ impl Controller {
         Ok(())
     }
 
-    async fn core_get_config(&mut self, cmd: nci::CoreGetConfigCommand) -> Result<()> {
+    async fn core_get_config(&self, cmd: nci::CoreGetConfigCommand) -> Result<()> {
         println!("+ core_get_config_cmd()");
 
+        let state = self.state.lock().await;
         let mut valid_parameters = vec![];
         let mut invalid_parameters = vec![];
         for id in cmd.get_parameters() {
-            match self.config_parameters.get(id) {
+            match state.config_parameters.get(id) {
                 Some(value) => {
                     valid_parameters.push(nci::ConfigParameter { id: *id, value: value.clone() })
                 }
@@ -219,14 +225,17 @@ impl Controller {
         Ok(())
     }
 
-    async fn core_conn_create(&mut self, cmd: nci::CoreConnCreateCommand) -> Result<()> {
+    async fn core_conn_create(&self, cmd: nci::CoreConnCreateCommand) -> Result<()> {
         println!("+ core_conn_create()");
 
+        let mut state = self.state.lock().await;
         let result: std::result::Result<u8, nci::Status> = (|| {
             // Retrieve an unused connection ID for the logical connection.
-            let conn_id = (0..MAX_LOGICAL_CONNECTIONS)
-                .find(|conn_id| self.logical_connections[*conn_id as usize].is_none())
-                .ok_or(nci::Status::Rejected)?;
+            let conn_id = {
+                (0..MAX_LOGICAL_CONNECTIONS)
+                    .find(|conn_id| state.logical_connections[*conn_id as usize].is_none())
+                    .ok_or(nci::Status::Rejected)?
+            };
 
             // Check that the selected destination type is supported and validate
             // the destination specific parameters.
@@ -265,12 +274,12 @@ impl Controller {
             // The combination of Destination Type and Destination Specific
             // Parameters SHALL uniquely identify a single destination for the
             // Logical Connection.
-            if self.logical_connections.iter().any(|c| c.as_ref() == Some(&logical_connection)) {
+            if state.logical_connections.iter().any(|c| c.as_ref() == Some(&logical_connection)) {
                 return Err(nci::Status::Rejected);
             }
 
             // Create the connection.
-            self.logical_connections[conn_id as usize] = Some(logical_connection);
+            state.logical_connections[conn_id as usize] = Some(logical_connection);
 
             Ok(conn_id)
         })();
@@ -294,12 +303,13 @@ impl Controller {
         Ok(())
     }
 
-    async fn core_conn_close(&mut self, cmd: nci::CoreConnCloseCommand) -> Result<()> {
+    async fn core_conn_close(&self, cmd: nci::CoreConnCloseCommand) -> Result<()> {
         println!("+ core_conn_close({})", cmd.get_conn_id());
 
+        let mut state = self.state.lock().await;
         let conn_id = cmd.get_conn_id();
         let status = if conn_id >= MAX_LOGICAL_CONNECTIONS
-            || self.logical_connections[conn_id as usize].is_none()
+            || state.logical_connections[conn_id as usize].is_none()
         {
             // If there is no connection associated to the Conn ID in the CORE_CONN_CLOSE_CMD, the
             // NFCC SHALL reject the connection closure request by sending a CORE_CONN_CLOSE_RSP
@@ -309,7 +319,7 @@ impl Controller {
             // When it receives a CORE_CONN_CLOSE_CMD for an existing connection, the NFCC SHALL
             // accept the connection closure request by sending a CORE_CONN_CLOSE_RSP with a Status of
             // STATUS_OK, and the Logical Connection is closed.
-            self.logical_connections[conn_id as usize] = None;
+            state.logical_connections[conn_id as usize] = None;
             nci::Status::Ok
         };
 
@@ -318,10 +328,7 @@ impl Controller {
         Ok(())
     }
 
-    async fn core_set_power_sub_state(
-        &mut self,
-        cmd: nci::CoreSetPowerSubStateCommand,
-    ) -> Result<()> {
+    async fn core_set_power_sub_state(&self, cmd: nci::CoreSetPowerSubStateCommand) -> Result<()> {
         println!("+ core_set_power_sub_state({:?})", cmd.get_power_state());
 
         self.send_control(nci::CoreSetPowerSubStateResponseBuilder { status: nci::Status::Ok })
@@ -330,7 +337,7 @@ impl Controller {
         Ok(())
     }
 
-    async fn rf_discover_map(&mut self, _cmd: nci::RfDiscoverMapCommand) -> Result<()> {
+    async fn rf_discover_map(&self, _cmd: nci::RfDiscoverMapCommand) -> Result<()> {
         println!("+ rf_discover_map()");
 
         self.send_control(nci::RfDiscoverMapResponseBuilder { status: nci::Status::Ok }).await?;
@@ -339,7 +346,7 @@ impl Controller {
     }
 
     async fn rf_set_listen_mode_routing(
-        &mut self,
+        &self,
         _cmd: nci::RfSetListenModeRoutingCommand,
     ) -> Result<()> {
         println!("+ rf_set_listen_mode_routing()");
@@ -351,7 +358,7 @@ impl Controller {
     }
 
     async fn rf_get_listen_mode_routing(
-        &mut self,
+        &self,
         _cmd: nci::RfGetListenModeRoutingCommand,
     ) -> Result<()> {
         println!("+ rf_get_listen_mode_routing()");
@@ -366,7 +373,7 @@ impl Controller {
         Ok(())
     }
 
-    async fn rf_discover(&mut self, _cmd: nci::RfDiscoverCommand) -> Result<()> {
+    async fn rf_discover(&self, _cmd: nci::RfDiscoverCommand) -> Result<()> {
         println!("+ rf_discover()");
 
         self.send_control(nci::RfDiscoverResponseBuilder { status: nci::Status::Ok }).await?;
@@ -374,7 +381,7 @@ impl Controller {
         Ok(())
     }
 
-    async fn rf_deactivate(&mut self, cmd: nci::RfDeactivateCommand) -> Result<()> {
+    async fn rf_deactivate(&self, cmd: nci::RfDeactivateCommand) -> Result<()> {
         println!("+ rf_deactivate({:?})", cmd.get_deactivation_type());
 
         self.send_control(nci::RfDeactivateResponseBuilder { status: nci::Status::Ok }).await?;
@@ -388,7 +395,7 @@ impl Controller {
         Ok(())
     }
 
-    async fn nfcee_discover(&mut self, _cmd: nci::NfceeDiscoverCommand) -> Result<()> {
+    async fn nfcee_discover(&self, _cmd: nci::NfceeDiscoverCommand) -> Result<()> {
         println!("+ nfcee_discover()");
 
         self.send_control(nci::NfceeDiscoverResponseBuilder {
@@ -400,7 +407,7 @@ impl Controller {
         Ok(())
     }
 
-    async fn receive_command(&mut self, packet: nci::ControlPacket) -> Result<()> {
+    async fn receive_command(&self, packet: nci::ControlPacket) -> Result<()> {
         use nci::ControlPacketChild::*;
         use nci::CorePacketChild::*;
         use nci::NfceePacketChild::*;
@@ -433,23 +440,33 @@ impl Controller {
         }
     }
 
-    async fn receive_data(&mut self, _packet: nci::DataPacket) {
+    async fn receive_data(&self, _packet: nci::DataPacket) {
         todo!()
     }
 
-    async fn receive_rf(&mut self, _packet: Vec<u8>) {
+    async fn receive_rf(&self, _packet: Vec<u8>) -> Result<()> {
         todo!()
     }
 
     /// Timer handler method. This function is invoked at regular interval
     /// on the NFCC instance and is used to drive internal timers.
-    pub async fn tick(&mut self) {}
+    async fn tick(&self) -> Result<()> {
+        Ok(())
+    }
 
     /// Main NFCC instance routine.
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(
+        id: usize,
+        nci_reader: NciReader,
+        nci_writer: NciWriter,
+        mut rf_rx: mpsc::Receiver<Vec<u8>>,
+        rf_tx: mpsc::Sender<(usize, Vec<u8>)>,
+    ) -> Result<()> {
+        // Local controller state.
+        let nfcc = Controller::new(id, nci_writer, rf_tx);
         // Send a Reset notification on controller creation corresponding
         // to a power on.
-        self.send_control(nci::CoreResetNotificationBuilder {
+        nfcc.send_control(nci::CoreResetNotificationBuilder {
             trigger: nci::ResetTrigger::PowerOn,
             config_status: nci::ConfigStatus::ConfigReset,
             nci_version: NCI_VERSION,
@@ -461,25 +478,47 @@ impl Controller {
         // Timer for tick events.
         let mut timer = time::interval(Duration::from_millis(5));
 
-        // Loop waiting for commands or external events.
-        loop {
-            select! {
-                result = self.nci_reader.read() => {
-                    let packet = result?;
+        let result: Result<((), (), ())> = futures::future::try_join3(
+            // NCI event handler.
+            async {
+                loop {
+                    let packet = nci_reader.read().await?;
                     let header = nci::PacketHeader::parse(&packet[0..3])?;
                     match header.get_mt() {
-                        nci::MessageType::Data =>
-                            self.receive_data(nci::DataPacket::parse(&packet)?).await,
-                        nci::MessageType::Command =>
-                            self.receive_command(nci::ControlPacket::parse(&packet)?).await?,
-                        mt => return Err(anyhow::anyhow!("unexpected message type {:?} in received NCI packet", mt))
+                        nci::MessageType::Data => {
+                            nfcc.receive_data(nci::DataPacket::parse(&packet)?).await
+                        }
+                        nci::MessageType::Command => {
+                            nfcc.receive_command(nci::ControlPacket::parse(&packet)?).await?
+                        }
+                        mt => {
+                            return Err(anyhow::anyhow!(
+                                "unexpected message type {:?} in received NCI packet",
+                                mt
+                            ))
+                        }
                     }
-                },
-                result = self.rf_rx.recv() => {
-                    self.receive_rf(result.ok_or(anyhow::anyhow!("rf_rx channel closed"))?).await
-                },
-                _ = timer.tick() => self.tick().await
-            }
-        }
+                }
+            },
+            // RF event handler.
+            async {
+                loop {
+                    nfcc.receive_rf(
+                        rf_rx.recv().await.ok_or(anyhow::anyhow!("rf_rx channel closed"))?,
+                    )
+                    .await?
+                }
+            },
+            // Timer event handler.
+            async {
+                loop {
+                    timer.tick().await;
+                    nfcc.tick().await?
+                }
+            },
+        )
+        .await;
+        result?;
+        Ok(())
     }
 }
