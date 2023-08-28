@@ -38,6 +38,9 @@ const MAX_NFCV_RF_FRAME_SIZE: u16 = 512;
 /// sending a poll command.
 const POLL_RESPONSE_TIMEOUT: u64 = 200;
 
+const STATIC_RF_CONN: u8 = 0;
+const STATIC_HCI_CONN: u8 = 1;
+
 /// State of an NFCC logical connection with the DH.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
@@ -685,9 +688,70 @@ impl Controller {
         }
     }
 
-    async fn receive_data(&self, _packet: nci::DataPacket) -> Result<()> {
-        println!("+ receive_data()");
+    async fn rf_conn_data(&self, packet: nci::DataPacket) -> Result<()> {
+        println!("  > received data on RF logical connection");
+
+        // TODO(henrichataing) implement credit based control flow.
+        let state = self.state.lock().await;
+        match state.rf_state {
+            RfState::PollActive {
+                id,
+                rf_technology,
+                rf_protocol: rf::Protocol::IsoDep,
+                rf_interface: nci::RfInterfaceType::IsoDep,
+                ..
+            } => {
+                self.send_rf(rf::DataBuilder {
+                    receiver: id,
+                    sender: self.id,
+                    protocol: rf::Protocol::IsoDep,
+                    technology: rf_technology,
+                    data: packet.get_payload().into(),
+                })
+                .await?;
+                // Resplenish the credit count for the RF Connection.
+                self.send_control(
+                    nci::CoreConnCreditsNotificationBuilder {
+                        connections: vec![nci::ConnectionCredits {
+                            conn_id: STATIC_RF_CONN,
+                            credits: 1,
+                        }],
+                    }
+                    .build(),
+                )
+                .await
+            }
+            RfState::PollActive { rf_protocol, rf_interface, .. } => unimplemented!(
+                "unsupported combination of RF protocol {:?} and interface {:?}",
+                rf_protocol,
+                rf_interface
+            ),
+            RfState::ListenActive => unimplemented!("unsupported data in active listen mode"),
+            _ => {
+                println!("  > ignored RF data packet while not in active listen or poll mode");
+                Ok(())
+            }
+        }
+    }
+
+    async fn hci_conn_data(&self, _packet: nci::DataPacket) -> Result<()> {
+        println!("  > received data on HCI logical connection");
         todo!()
+    }
+
+    async fn dynamic_conn_data(&self, _packet: nci::DataPacket) -> Result<()> {
+        println!("  > received data on dynamic logical connection");
+        todo!()
+    }
+
+    async fn receive_data(&self, packet: nci::DataPacket) -> Result<()> {
+        println!("+ receive_data({})", packet.get_conn_id());
+
+        match packet.get_conn_id() {
+            STATIC_RF_CONN => self.rf_conn_data(packet).await,
+            STATIC_HCI_CONN => self.hci_conn_data(packet).await,
+            _ => self.dynamic_conn_data(packet).await,
+        }
     }
 
     async fn poll_command(&self, cmd: rf::PollCommand) -> Result<()> {
@@ -820,10 +884,37 @@ impl Controller {
         Ok(())
     }
 
-    async fn data_packet(&self, _data: rf::Data) -> Result<()> {
+    async fn data_packet(&self, data: rf::Data) -> Result<()> {
         println!("+ data_packet()");
 
-        Ok(())
+        let state = self.state.lock().await;
+        match (state.rf_state, data.get_protocol()) {
+            (
+                RfState::PollActive {
+                    id, rf_technology, rf_protocol: rf::Protocol::IsoDep, ..
+                },
+                rf::Protocol::IsoDep,
+            ) if data.get_sender() == id && data.get_technology() == rf_technology => {
+                self.send_data(nci::DataPacketBuilder {
+                    mt: nci::MessageType::Data,
+                    conn_id: STATIC_RF_CONN,
+                    cr: 1, // TODO: credit based control flow
+                    payload: Some(bytes::Bytes::copy_from_slice(data.get_data())),
+                })
+                .await
+            }
+            (RfState::PollActive { id, .. }, _) if id != data.get_sender() => {
+                println!("  > ignored RF data packet sent from an un-selected device");
+                Ok(())
+            }
+            (RfState::PollActive { .. }, _) => {
+                unimplemented!("unsupported combination of technology and protocol")
+            }
+            (_, _) => {
+                println!("  > ignored RF data packet received in inactive state");
+                Ok(())
+            }
+        }
     }
 
     async fn receive_rf(&self, packet: rf::RfPacket) -> Result<()> {

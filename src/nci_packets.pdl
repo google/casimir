@@ -120,7 +120,7 @@ packet ControlPacket {
 // Pre-framed NCI data packet. The framing information is ignored
 // including the payload length.
 packet DataPacket {
-  conn_id : GroupId,
+  conn_id : 4,
   _reserved_ : 1,
   mt : MessageType,
   cr : 2,
@@ -408,7 +408,7 @@ packet CoreConnCloseResponse : CorePacket (mt = RESPONSE, oid = CONN_CLOSE) {
 
 struct ConnectionCredits {
   conn_id : 8,
-  credist : 8,
+  credits : 8,
 }
 
 packet CoreConnCreditsNotification : CorePacket (mt = NOTIFICATION, oid = CONN_CREDITS) {
