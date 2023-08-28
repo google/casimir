@@ -46,6 +46,8 @@ pub enum LogicalConnection {
 }
 
 /// State of the RF Discovery of an NFCC instance.
+/// The state WaitForAllDiscoveries is not represented as it is implied
+/// by the discovery routine.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code, missing_docs)]
 pub enum RfState {
@@ -59,12 +61,13 @@ pub enum RfState {
     },
     ListenSleep,
     ListenActive,
-    WaitForAllDiscoveries,
     WaitForHostSelect,
     WaitForSelectResponse {
+        id: u16,
         rf_discovery_id: usize,
         rf_interface: nci::RfInterfaceType,
-        rf_protocol: nci::RfProtocolType,
+        rf_technology: rf::Technology,
+        rf_protocol: rf::Protocol,
     },
 }
 
@@ -77,7 +80,7 @@ pub enum RfMode {
 
 /// Poll responses received in the context of RF discovery in active
 /// Listen mode.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RfPollResponse {
     id: u16,
     rf_protocol: rf::Protocol,
@@ -141,6 +144,15 @@ impl State {
             nci::RfProtocolType::NfcDep => nci::RfInterfaceType::NfcDep,
             nci::RfProtocolType::Ndef if mode == RfMode::Poll => nci::RfInterfaceType::Ndef,
             _ => nci::RfInterfaceType::Frame,
+        }
+    }
+
+    /// Insert a poll response into the discovery list.
+    /// The response is not inserted if the device was already discovered
+    /// with the same parameters.
+    fn add_poll_response(&mut self, poll_response: RfPollResponse) {
+        if !self.rf_poll_responses.contains(&poll_response) {
+            self.rf_poll_responses.push(poll_response);
         }
     }
 }
@@ -497,6 +509,10 @@ impl Controller {
             return Ok(());
         }
 
+        for config in cmd.get_configurations() {
+            println!(" > {:?}", config.technology_and_mode);
+        }
+
         state.discover_configuration = cmd.get_configurations().clone();
         state.rf_state = RfState::Discovery;
 
@@ -557,13 +573,68 @@ impl Controller {
     async fn rf_deactivate(&self, cmd: nci::RfDeactivateCommand) -> Result<()> {
         println!("+ rf_deactivate({:?})", cmd.get_deactivation_type());
 
-        self.send_control(nci::RfDeactivateResponseBuilder { status: nci::Status::Ok }).await?;
+        use nci::DeactivationType::*;
 
-        self.send_control(nci::RfDeactivateNotificationBuilder {
-            deactivation_type: cmd.get_deactivation_type(),
-            deactivation_reason: nci::DeactivationReason::DhRequest,
-        })
-        .await?;
+        let mut state = self.state.lock().await;
+        let (status, mut next_state) = match (state.rf_state, cmd.get_deactivation_type()) {
+            (RfState::Idle, _) => (nci::Status::SemanticError, RfState::Idle),
+            (RfState::Discovery, IdleMode) => (nci::Status::Ok, RfState::Idle),
+            (RfState::Discovery, _) => (nci::Status::SemanticError, RfState::Discovery),
+            (RfState::PollActive { .. }, IdleMode) => (nci::Status::Ok, RfState::Idle),
+            (RfState::PollActive { .. }, SleepMode | SleepAfMode) => {
+                (nci::Status::Ok, RfState::WaitForHostSelect)
+            }
+            (RfState::PollActive { .. }, Discover) => (nci::Status::Ok, RfState::Discovery),
+            (RfState::ListenSleep, IdleMode) => (nci::Status::Ok, RfState::Idle),
+            (RfState::ListenSleep, _) => (nci::Status::SemanticError, RfState::ListenSleep),
+            (RfState::ListenActive, IdleMode) => (nci::Status::Ok, RfState::Idle),
+            (RfState::ListenActive, SleepMode | SleepAfMode) => {
+                (nci::Status::Ok, RfState::ListenSleep)
+            }
+            (RfState::ListenActive, Discover) => (nci::Status::Ok, RfState::Discovery),
+            (RfState::WaitForHostSelect, IdleMode) => (nci::Status::Ok, RfState::Idle),
+            (RfState::WaitForHostSelect, _) => {
+                (nci::Status::SemanticError, RfState::WaitForHostSelect)
+            }
+            (RfState::WaitForSelectResponse { .. }, IdleMode) => (nci::Status::Ok, RfState::Idle),
+            (RfState::WaitForSelectResponse { .. }, _) => {
+                (nci::Status::SemanticError, state.rf_state)
+            }
+        };
+
+        // Update the state now to prevent interface activation from
+        // completing if a remote device is being selected.
+        (next_state, state.rf_state) = (state.rf_state, next_state);
+
+        self.send_control(nci::RfDeactivateResponseBuilder { status }).await?;
+
+        // Deactivate the active RF interface if applicable.
+        match next_state {
+            RfState::PollActive { .. } | RfState::ListenActive { .. } => {
+                self.send_control(nci::RfDeactivateNotificationBuilder {
+                    deactivation_type: cmd.get_deactivation_type(),
+                    deactivation_reason: nci::DeactivationReason::DhRequest,
+                })
+                .await?
+            }
+            _ => (),
+        }
+
+        // Deselect the remote device if applicable.
+        match next_state {
+            RfState::PollActive { id, rf_protocol, rf_technology, .. }
+            | RfState::WaitForSelectResponse { id, rf_protocol, rf_technology, .. } => {
+                self.send_rf(rf::DeactivateNotificationBuilder {
+                    receiver: id,
+                    protocol: rf_protocol,
+                    technology: rf_technology,
+                    sender: self.id,
+                    reason: rf::DeactivateReason::DhRequest,
+                })
+                .await?
+            }
+            _ => (),
+        }
 
         Ok(())
     }
@@ -615,6 +686,7 @@ impl Controller {
     }
 
     async fn receive_data(&self, _packet: nci::DataPacket) -> Result<()> {
+        println!("+ receive_data()");
         todo!()
     }
 
@@ -673,7 +745,7 @@ impl Controller {
         let sel_res = int_protocol << 5;
 
         for rf_protocol in rf_protocols {
-            state.rf_poll_responses.push(RfPollResponse {
+            state.add_poll_response(RfPollResponse {
                 id: cmd.get_sender(),
                 rf_protocol: *rf_protocol,
                 rf_technology: rf::Technology::NfcA,
@@ -701,19 +773,23 @@ impl Controller {
         println!("+ t4at_select_response()");
 
         let mut state = self.state.lock().await;
-        let (rf_discovery_id, rf_interface, rf_protocol) = match state.rf_state {
-            RfState::WaitForSelectResponse { rf_discovery_id, rf_interface, rf_protocol } => {
-                (rf_discovery_id, rf_interface, rf_protocol)
-            }
+        let (id, rf_discovery_id, rf_interface, rf_protocol) = match state.rf_state {
+            RfState::WaitForSelectResponse {
+                id,
+                rf_discovery_id,
+                rf_interface,
+                rf_protocol,
+                ..
+            } => (id, rf_discovery_id, rf_interface, rf_protocol),
             _ => return Ok(()),
         };
 
-        if state.rf_poll_responses[rf_discovery_id].id != cmd.get_sender() {
+        if cmd.get_sender() != id {
             return Ok(());
         }
 
         state.rf_state = RfState::PollActive {
-            id: state.rf_poll_responses[rf_discovery_id].id,
+            id,
             rf_protocol: state.rf_poll_responses[rf_discovery_id].rf_protocol,
             rf_technology: state.rf_poll_responses[rf_discovery_id].rf_technology,
             rf_interface,
@@ -722,7 +798,7 @@ impl Controller {
         self.send_control(nci::RfIntfActivatedNotificationBuilder {
             rf_discovery_id: rf_discovery_id as u8,
             rf_interface,
-            rf_protocol,
+            rf_protocol: rf_protocol.into(),
             activation_rf_technology_and_mode: nci::RfTechnologyAndMode::NfcAPassivePollMode,
             max_data_packet_payload_size: MAX_DATA_PACKET_PAYLOAD_SIZE,
             initial_number_of_credits: 1,
@@ -744,6 +820,12 @@ impl Controller {
         Ok(())
     }
 
+    async fn data_packet(&self, _data: rf::Data) -> Result<()> {
+        println!("+ data_packet()");
+
+        Ok(())
+    }
+
     async fn receive_rf(&self, packet: rf::RfPacket) -> Result<()> {
         use rf::RfPacketChild::*;
 
@@ -758,6 +840,7 @@ impl Controller {
             // changed to RFST_LISTEN_ACTIVE.
             T4ATSelectCommand(cmd) => self.t4at_select_command(cmd).await,
             T4ATSelectResponse(cmd) => self.t4at_select_response(cmd).await,
+            Data(cmd) => self.data_packet(cmd).await,
             _ => unimplemented!(),
         }
     }
@@ -812,8 +895,13 @@ impl Controller {
             _ => todo!(),
         }
 
-        state.rf_state =
-            RfState::WaitForSelectResponse { rf_discovery_id, rf_interface, rf_protocol };
+        state.rf_state = RfState::WaitForSelectResponse {
+            id: state.rf_poll_responses[rf_discovery_id].id,
+            rf_discovery_id,
+            rf_interface,
+            rf_protocol: rf_protocol.into(),
+            rf_technology,
+        };
         Ok(())
     }
 
