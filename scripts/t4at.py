@@ -51,9 +51,9 @@ class T4AT:
         header_bytes = int.to_bytes(len(packet_bytes), length=2, byteorder='little')
         self.writer.write(header_bytes + packet_bytes)
 
-    async def discovery(self):
-        """Discovery mode. Respond to poll requests until the device
-        is activated by a select command."""
+    async def listen(self):
+        """Emulate device in passive listen mode. Respond to poll requests until
+        the device is activated by a select command."""
         while True:
             packet = await self._read()
             match packet:
@@ -69,6 +69,35 @@ class T4AT:
                 case _:
                     pass
 
+    async def poll(self):
+        """Emulate device in passive poll mode. Automatically selects the
+        first discovered device."""
+        while True:
+            try:
+                self._write(rf.PollCommand(technology=rf.Technology.NFC_A))
+                packet = await asyncio.wait_for(self._read(), timeout=1.0)
+                match packet:
+                    # [DIGITAL] Table 20: SEL_RES Response Format
+                    # 01b: Configured for Type 4A Tag Platform
+                    case rf.NfcAPollResponse(int_protocol=0b01):
+                        nfcid1 = bytes(packet.nfcid1)
+                        print(f"discovered t4at device with nfcid1 #{nfcid1.hex()}")
+                        self._write(rf.T4ATSelectCommand(receiver=packet.sender, param=0))
+                        response = await asyncio.wait_for(
+                            self.wait_for_select_response(packet.sender), timeout=1.0)
+                        print(f"t4at device activation complete")
+                        await self.active(response.sender)
+                    case _:
+                        pass
+            except TimeoutError:
+                pass
+
+    async def wait_for_select_response(self, sender_id: int):
+        while True:
+            packet = await self._read()
+            if isinstance(packet, rf.T4ATSelectResponse) and packet.sender == sender_id:
+                return packet
+
     async def active(self, peer: int):
         """Active mode. Respond to data requests until the device
         is deselected."""
@@ -83,12 +112,17 @@ class T4AT:
                     pass
 
 
-async def run(address: str, rf_port: int):
+async def run(address: str, rf_port: int, mode: str):
     """Emulate a T4AT compatible device in Listen mode."""
     try:
         reader, writer = await asyncio.open_connection(address, rf_port)
         device = T4AT(reader, writer)
-        await device.discovery()
+        if mode == 'poll':
+            await device.poll()
+        elif mode == 'listen':
+            await device.listen()
+        else:
+            print(f"unsupported device mode {mode}")
     except Exception as exn:
         print(
             f'Failed to connect to Casimir server at address {address}:{rf_port}:\n' +
@@ -108,6 +142,11 @@ def main():
                         type=int,
                         default=7001,
                         help='Select the casimir TCP RF port')
+    parser.add_argument('--mode',
+                        type=str,
+                        choices=['poll', 'listen'],
+                        default='poll',
+                        help='Select the tag mode')
     asyncio.run(run(**vars(parser.parse_args())))
 
 
