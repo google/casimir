@@ -62,9 +62,9 @@ impl From<nci::RfProtocolType> for rf::Protocol {
     }
 }
 
-impl TryFrom<&nci::RfTechnologyAndMode> for rf::Technology {
+impl TryFrom<nci::RfTechnologyAndMode> for rf::Technology {
     type Error = nci::RfTechnologyAndMode;
-    fn try_from(protocol: &nci::RfTechnologyAndMode) -> Result<Self, Self::Error> {
+    fn try_from(protocol: nci::RfTechnologyAndMode) -> Result<Self, Self::Error> {
         Ok(match protocol {
             nci::RfTechnologyAndMode::NfcAPassivePollMode
             | nci::RfTechnologyAndMode::NfcAPassiveListenMode => rf::Technology::NfcA,
@@ -73,7 +73,7 @@ impl TryFrom<&nci::RfTechnologyAndMode> for rf::Technology {
             nci::RfTechnologyAndMode::NfcFPassivePollMode
             | nci::RfTechnologyAndMode::NfcFPassiveListenMode => rf::Technology::NfcF,
             nci::RfTechnologyAndMode::NfcVPassivePollMode => rf::Technology::NfcV,
-            _ => return Err(*protocol),
+            _ => return Err(protocol),
         })
     }
 }
