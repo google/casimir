@@ -38,9 +38,6 @@ const MAX_NFCV_RF_FRAME_SIZE: u16 = 512;
 /// sending a poll command.
 const POLL_RESPONSE_TIMEOUT: u64 = 200;
 
-const STATIC_RF_CONN: u8 = 0;
-const STATIC_HCI_CONN: u8 = 1;
-
 /// State of an NFCC logical connection with the DH.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
@@ -418,13 +415,13 @@ impl Controller {
                 status: nci::Status::Ok,
                 max_data_packet_payload_size: MAX_DATA_PACKET_PAYLOAD_SIZE,
                 initial_number_of_credits: 0xff,
-                conn_id,
+                conn_id: nci::ConnId::from_dynamic(conn_id),
             },
             Err(status) => nci::CoreConnCreateResponseBuilder {
                 status,
                 max_data_packet_payload_size: 0,
                 initial_number_of_credits: 0xff,
-                conn_id: 0,
+                conn_id: 0.try_into().unwrap(),
             },
         })
         .await?;
@@ -433,10 +430,21 @@ impl Controller {
     }
 
     async fn core_conn_close(&self, cmd: nci::CoreConnCloseCommand) -> Result<()> {
-        println!("+ core_conn_close({})", cmd.get_conn_id());
+        println!("+ core_conn_close({})", u8::from(cmd.get_conn_id()));
 
         let mut state = self.state.lock().await;
-        let conn_id = cmd.get_conn_id();
+        let conn_id = match cmd.get_conn_id() {
+            nci::ConnId::StaticRf | nci::ConnId::StaticHci => {
+                println!(" > core_conn_close with static conn_id");
+                self.send_control(nci::CoreConnCloseResponseBuilder {
+                    status: nci::Status::Rejected,
+                })
+                .await?;
+                return Ok(());
+            }
+            nci::ConnId::Dynamic(id) => nci::ConnId::to_dynamic(id),
+        };
+
         let status = if conn_id >= MAX_LOGICAL_CONNECTIONS
             || state.logical_connections[conn_id as usize].is_none()
         {
@@ -533,7 +541,6 @@ impl Controller {
         println!("+ rf_discover_select()");
 
         let mut state = self.state.lock().await;
-        let rf_discovery_id = cmd.get_rf_discovery_id() as usize;
 
         if state.rf_state != RfState::WaitForHostSelect {
             println!("rf_discover_select_cmd received in {:?} state", state.rf_state);
@@ -543,6 +550,18 @@ impl Controller {
             .await?;
             return Ok(());
         }
+
+        let rf_discovery_id = match cmd.get_rf_discovery_id() {
+            nci::RfDiscoveryId::Rfu(_) => {
+                println!("rf_discover_select_cmd with reserved rf_discovery_id");
+                self.send_control(nci::RfDiscoverSelectResponseBuilder {
+                    status: nci::Status::Rejected,
+                })
+                .await?;
+                return Ok(());
+            }
+            nci::RfDiscoveryId::Id(id) => nci::RfDiscoveryId::to_index(id),
+        };
 
         // If the RF Discovery ID, RF Protocol or RF Interface is not valid,
         // the NFCC SHALL respond with RF_DISCOVER_SELECT_RSP with a Status of
@@ -725,7 +744,7 @@ impl Controller {
                 self.send_control(
                     nci::CoreConnCreditsNotificationBuilder {
                         connections: vec![nci::ConnectionCredits {
-                            conn_id: STATIC_RF_CONN,
+                            conn_id: nci::ConnId::StaticRf,
                             credits: 1,
                         }],
                     }
@@ -751,18 +770,18 @@ impl Controller {
         todo!()
     }
 
-    async fn dynamic_conn_data(&self, _packet: nci::DataPacket) -> Result<()> {
+    async fn dynamic_conn_data(&self, _conn_id: u8, _packet: nci::DataPacket) -> Result<()> {
         println!("  > received data on dynamic logical connection");
         todo!()
     }
 
     async fn receive_data(&self, packet: nci::DataPacket) -> Result<()> {
-        println!("+ receive_data({})", packet.get_conn_id());
+        println!("+ receive_data({})", u8::from(packet.get_conn_id()));
 
         match packet.get_conn_id() {
-            STATIC_RF_CONN => self.rf_conn_data(packet).await,
-            STATIC_HCI_CONN => self.hci_conn_data(packet).await,
-            _ => self.dynamic_conn_data(packet).await,
+            nci::ConnId::StaticRf => self.rf_conn_data(packet).await,
+            nci::ConnId::StaticHci => self.hci_conn_data(packet).await,
+            nci::ConnId::Dynamic(id) => self.dynamic_conn_data(*id, packet).await,
         }
     }
 
@@ -880,7 +899,7 @@ impl Controller {
         .await?;
 
         self.send_control(nci::RfIntfActivatedNotificationBuilder {
-            rf_discovery_id: 0,
+            rf_discovery_id: nci::RfDiscoveryId::reserved(),
             rf_interface: nci::RfInterfaceType::IsoDep,
             rf_protocol: nci::RfProtocolType::IsoDep,
             activation_rf_technology_and_mode: nci::RfTechnologyAndMode::NfcAPassiveListenMode,
@@ -929,7 +948,7 @@ impl Controller {
         };
 
         self.send_control(nci::RfIntfActivatedNotificationBuilder {
-            rf_discovery_id: rf_discovery_id as u8,
+            rf_discovery_id: nci::RfDiscoveryId::from_index(rf_discovery_id),
             rf_interface,
             rf_protocol: rf_protocol.into(),
             activation_rf_technology_and_mode: nci::RfTechnologyAndMode::NfcAPassivePollMode,
@@ -972,7 +991,7 @@ impl Controller {
             ) if data.get_sender() == id && data.get_technology() == rf_technology => {
                 self.send_data(nci::DataPacketBuilder {
                     mt: nci::MessageType::Data,
-                    conn_id: STATIC_RF_CONN,
+                    conn_id: nci::ConnId::StaticRf,
                     cr: 1, // TODO(henrichataing): credit based control flow
                     payload: Some(bytes::Bytes::copy_from_slice(data.get_data())),
                 })
@@ -1152,7 +1171,7 @@ impl Controller {
         let last_index = state.rf_poll_responses.len() - 1;
         for (index, response) in state.rf_poll_responses.clone().iter().enumerate() {
             self.send_control(nci::RfDiscoverNotificationBuilder {
-                rf_discovery_id: index as u8,
+                rf_discovery_id: nci::RfDiscoveryId::from_index(index),
                 rf_protocol: response.rf_protocol.into(),
                 rf_technology_and_mode: match response.rf_technology {
                     rf::Technology::NfcA => nci::RfTechnologyAndMode::NfcAPassivePollMode,

@@ -97,6 +97,19 @@ enum Status : 8 {
   NFCEE_TIMEOUT_ERROR = 0xC3,
 }
 
+// [NCI] Table 4: Conn ID
+enum ConnId : 4 {
+  STATIC_RF = 0x0,
+  STATIC_HCI = 0x1,
+  DYNAMIC = 0x2 .. 0xf,
+}
+
+// [NCI] Table 67: RF Discovery ID
+enum RfDiscoveryId : 8 {
+  ID = 0x01 .. 0xfe,
+  RFU = ..,
+}
+
 // Generic format for NCI packet headers.
 // The Control and Data packets differ in the reserved fields
 // but the framing information is the same.
@@ -120,7 +133,7 @@ packet ControlPacket {
 // Pre-framed NCI data packet. The framing information is ignored
 // including the payload length.
 packet DataPacket {
-  conn_id : 4,
+  conn_id : ConnId,
   _reserved_ : 1,
   mt : MessageType,
   cr : 2,
@@ -395,11 +408,13 @@ packet CoreConnCreateResponse : CorePacket (mt = RESPONSE, oid = CONN_CREATE) {
   status : Status,
   max_data_packet_payload_size : 8,
   initial_number_of_credits : 8,
-  conn_id : 8,
+  conn_id : ConnId,
+  _reserved_ : 4,
 }
 
 packet CoreConnCloseCommand : CorePacket (mt = COMMAND, oid = CONN_CLOSE) {
-  conn_id : 8,
+  conn_id : ConnId,
+  _reserved_ : 4,
 }
 
 packet CoreConnCloseResponse : CorePacket (mt = RESPONSE, oid = CONN_CLOSE) {
@@ -407,7 +422,8 @@ packet CoreConnCloseResponse : CorePacket (mt = RESPONSE, oid = CONN_CLOSE) {
 }
 
 struct ConnectionCredits {
-  conn_id : 8,
+  conn_id : ConnId,
+  _reserved_ : 4,
   credits : 8,
 }
 
@@ -531,7 +547,7 @@ enum DiscoverNotificationType : 8 {
 }
 
 packet RfDiscoverNotification : RfPacket (mt = NOTIFICATION, oid = DISCOVER) {
-  rf_discovery_id : 8,
+  rf_discovery_id : RfDiscoveryId,
   rf_protocol : RfProtocolType,
   rf_technology_and_mode : RfTechnologyAndMode,
   _size_(rf_technology_specific_parameters) : 8,
@@ -586,7 +602,7 @@ packet NfcVPollModeTechnologySpecificParameters {
 
 /// [NCI] Table 77: Control Messages to select a Discovered Target
 packet RfDiscoverSelectCommand : RfPacket (mt = COMMAND, oid = DISCOVER_SELECT) {
-  rf_discovery_id : 8,
+  rf_discovery_id : RfDiscoveryId,
   rf_protocol : RfProtocolType,
   rf_interface : RfInterfaceType,
 }
@@ -608,7 +624,7 @@ enum BitRate : 8 {
 }
 
 packet RfIntfActivatedNotification : RfPacket (mt = NOTIFICATION, oid = INTF_ACTIVATED) {
-  rf_discovery_id : 8,
+  rf_discovery_id : RfDiscoveryId,
   rf_interface : RfInterfaceType,
   rf_protocol : RfProtocolType,
   activation_rf_technology_and_mode : RfTechnologyAndMode,

@@ -21,6 +21,37 @@ pub mod nci {
     #![allow(missing_docs)]
 
     include!(concat!(env!("OUT_DIR"), "/nci_packets.rs"));
+
+    impl ConnId {
+        /// Create a Conn ID with `id` as an offset in the range of dynamic
+        /// identifiers.
+        pub fn from_dynamic(id: u8) -> Self {
+            ConnId::try_from(id as u8 + 2).unwrap()
+        }
+
+        /// Return the index for a dynamic Conn ID.
+        pub fn to_dynamic(id: Private<u8>) -> u8 {
+            *id - 2
+        }
+    }
+
+    impl RfDiscoveryId {
+        /// Create the default reserved RF Discovery ID.
+        pub fn reserved() -> Self {
+            RfDiscoveryId::try_from(0).unwrap()
+        }
+
+        /// Create an RF Discovery ID with `id` as an offset in the range of
+        /// non-reserved identifiers.
+        pub fn from_index(id: usize) -> Self {
+            RfDiscoveryId::try_from(id as u8 + 1).unwrap()
+        }
+
+        /// Return the index for a valid RF Discovery ID.
+        pub fn to_index(id: Private<u8>) -> usize {
+            *id as usize - 1
+        }
+    }
 }
 
 /// RF packet parser and serializer.
