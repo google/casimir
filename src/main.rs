@@ -201,7 +201,11 @@ pub struct Device {
 }
 
 impl Device {
-    fn nci(id: Id, socket: TcpStream, controller_rf_tx: mpsc::Sender<rf::RfPacket>) -> Device {
+    fn nci(
+        id: Id,
+        socket: TcpStream,
+        controller_rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
+    ) -> Device {
         let (rf_tx, rf_rx) = mpsc::channel(2);
         Device {
             id,
@@ -220,7 +224,11 @@ impl Device {
         }
     }
 
-    fn rf(id: Id, socket: TcpStream, controller_rf_tx: mpsc::Sender<rf::RfPacket>) -> Device {
+    fn rf(
+        id: Id,
+        socket: TcpStream,
+        controller_rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
+    ) -> Device {
         let (rf_tx, mut rf_rx) = mpsc::channel(2);
         Device {
             id,
@@ -245,7 +253,7 @@ impl Device {
                             let packet = rf::RfPacket::parse(&packet_bytes)?;
 
                             // Forward the packet to other devices.
-                            controller_rf_tx.send(packet).await?;
+                            controller_rf_tx.send(packet)?;
                         }
                         result = rf_rx.recv() => {
                             // Forward the packet to the socket connection.
@@ -260,15 +268,15 @@ impl Device {
     }
 }
 
-#[derive(Default)]
 struct Scene {
     next_id: u16,
+    rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
     devices: [Option<Device>; MAX_DEVICES],
 }
 
 impl Scene {
-    fn new() -> Scene {
-        Default::default()
+    fn new(rf_tx: mpsc::UnboundedSender<rf::RfPacket>) -> Scene {
+        Scene { next_id: 0, rf_tx, devices: Default::default() }
     }
 
     fn add_device(&mut self, builder: impl FnOnce(Id) -> Device) -> Result<Id> {
@@ -282,17 +290,42 @@ impl Scene {
         Err(anyhow::anyhow!("max number of connections reached"))
     }
 
+    fn disconnect(&mut self, n: usize) {
+        let id = self.devices[n].as_ref().unwrap().id;
+        self.devices[n] = None;
+        for other_n in 0..MAX_DEVICES {
+            let Some(ref device) = self.devices[other_n] else { continue };
+            assert!(n != other_n);
+            self.rf_tx
+                .send(
+                    rf::DeactivateNotificationBuilder {
+                        reason: rf::DeactivateReason::RfLinkLoss,
+                        sender: id,
+                        receiver: device.id,
+                        technology: rf::Technology::NfcA,
+                        protocol: rf::Protocol::Undetermined,
+                    }
+                    .into(),
+                )
+                .expect("failed to send deactive notification")
+        }
+    }
+
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         for n in 0..MAX_DEVICES {
-            if let Some(ref mut device) = &mut self.devices[n] {
-                match device.task.as_mut().poll(cx) {
+            let dropped = match self.devices[n] {
+                Some(ref mut device) => match device.task.as_mut().poll(cx) {
                     Poll::Ready(Ok(_)) => unreachable!(),
                     Poll::Ready(Err(err)) => {
                         println!("dropping device {}: {}", n, err);
-                        self.devices[n] = None;
+                        true
                     }
-                    Poll::Pending => (),
-                }
+                    Poll::Pending => false,
+                },
+                None => false,
+            };
+            if dropped {
+                self.disconnect(n)
             }
         }
         Poll::Pending
@@ -325,12 +358,12 @@ struct Opt {
 
 async fn run() -> Result<()> {
     let opt: Opt = argh::from_env();
-    let mut scene = Scene::new();
     let nci_listener =
         TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, opt.nci_port)).await?;
     let rf_listener =
         TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, opt.rf_port)).await?;
-    let (rf_tx, mut rf_rx) = mpsc::channel(2);
+    let (rf_tx, mut rf_rx) = mpsc::unbounded_channel();
+    let mut scene = Scene::new(rf_tx.clone());
     println!("Listening for NCI connections at address 127.0.0.1:{}", opt.nci_port);
     println!("Listening for RF connections at address 127.0.0.1:{}", opt.rf_port);
     loop {

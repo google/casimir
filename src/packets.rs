@@ -108,3 +108,15 @@ impl TryFrom<nci::RfTechnologyAndMode> for rf::Technology {
         })
     }
 }
+
+impl From<rf::DeactivateReason> for nci::DeactivationReason {
+    fn from(reason: rf::DeactivateReason) -> Self {
+        match reason {
+            rf::DeactivateReason::DhRequest => nci::DeactivationReason::DhRequest,
+            rf::DeactivateReason::EndpointRequest => nci::DeactivationReason::EndpointRequest,
+            rf::DeactivateReason::RfLinkLoss => nci::DeactivationReason::RfLinkLoss,
+            rf::DeactivateReason::NfcBBadAfi => nci::DeactivationReason::NfcBBadAfi,
+            rf::DeactivateReason::DhRequestFailed => nci::DeactivationReason::DhRequestFailed,
+        }
+    }
+}
