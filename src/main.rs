@@ -190,6 +190,10 @@ impl RfWriter {
 /// Devices communicate together through the RF mpsc channel.
 /// NFCCs are an instance of Device.
 pub struct Device {
+    // Unique identifier associated with the device.
+    // The identifier is assured never to be reused in the lifetime of
+    // the emulator.
+    id: u16,
     // Async task running the controller main loop.
     task: Pin<Box<dyn Future<Output = Result<()>>>>,
     // Channel for injecting RF data packets into the controller instance.
@@ -200,6 +204,7 @@ impl Device {
     fn nci(id: Id, socket: TcpStream, controller_rf_tx: mpsc::Sender<rf::RfPacket>) -> Device {
         let (rf_tx, rf_rx) = mpsc::channel(2);
         Device {
+            id,
             rf_tx,
             task: Box::pin(async move {
                 let (nci_rx, nci_tx) = socket.into_split();
@@ -218,6 +223,7 @@ impl Device {
     fn rf(id: Id, socket: TcpStream, controller_rf_tx: mpsc::Sender<rf::RfPacket>) -> Device {
         let (rf_tx, mut rf_rx) = mpsc::channel(2);
         Device {
+            id,
             rf_tx,
             task: Box::pin(async move {
                 let (socket_rx, socket_tx) = socket.into_split();
@@ -256,6 +262,7 @@ impl Device {
 
 #[derive(Default)]
 struct Scene {
+    next_id: u16,
     devices: [Option<Device>; MAX_DEVICES],
 }
 
@@ -265,24 +272,24 @@ impl Scene {
     }
 
     fn add_device(&mut self, builder: impl FnOnce(Id) -> Device) -> Result<Id> {
-        //socket: TcpStream, rf_tx: mpsc::Sender<(Id, Vec<u8>)>) -> Result<Id> {
-        for id in 0..MAX_DEVICES {
-            if self.devices[id].is_none() {
-                self.devices[id] = Some(builder(id as Id));
-                return Ok(id as Id);
+        for n in 0..MAX_DEVICES {
+            if self.devices[n].is_none() {
+                self.devices[n] = Some(builder(self.next_id));
+                self.next_id += 1;
+                return Ok(n as Id);
             }
         }
         Err(anyhow::anyhow!("max number of connections reached"))
     }
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        for id in 0..MAX_DEVICES {
-            if let Some(ref mut device) = &mut self.devices[id] {
+        for n in 0..MAX_DEVICES {
+            if let Some(ref mut device) = &mut self.devices[n] {
                 match device.task.as_mut().poll(cx) {
                     Poll::Ready(Ok(_)) => unreachable!(),
                     Poll::Ready(Err(err)) => {
-                        println!("dropping device {}: {}", id, err);
-                        self.devices[id] = None;
+                        println!("dropping device {}: {}", n, err);
+                        self.devices[n] = None;
                     }
                     Poll::Pending => (),
                 }
@@ -292,13 +299,11 @@ impl Scene {
     }
 
     async fn send(&self, packet: &rf::RfPacket) -> Result<()> {
-        for id in 0..MAX_DEVICES {
-            if id as Id == packet.get_sender()
-                || (packet.get_receiver() != u16::MAX && packet.get_receiver() != id as Id)
+        for n in 0..MAX_DEVICES {
+            let Some(ref device) = self.devices[n] else { continue };
+            if packet.get_sender() != device.id
+                && (packet.get_receiver() == u16::MAX || packet.get_receiver() == device.id)
             {
-                continue;
-            }
-            if let Some(ref device) = self.devices[id] {
                 device.rf_tx.send(packet.to_owned()).await?;
             }
         }
