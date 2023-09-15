@@ -16,7 +16,6 @@
 
 use anyhow::Result;
 use argh::FromArgs;
-use futures::future::poll_fn;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::pin::Pin;
@@ -197,7 +196,7 @@ pub struct Device {
     // Async task running the controller main loop.
     task: Pin<Box<dyn Future<Output = Result<()>>>>,
     // Channel for injecting RF data packets into the controller instance.
-    rf_tx: mpsc::Sender<rf::RfPacket>,
+    rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
 }
 
 impl Device {
@@ -206,7 +205,7 @@ impl Device {
         socket: TcpStream,
         controller_rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
     ) -> Device {
-        let (rf_tx, rf_rx) = mpsc::channel(2);
+        let (rf_tx, rf_rx) = mpsc::unbounded_channel();
         Device {
             id,
             rf_tx,
@@ -229,7 +228,7 @@ impl Device {
         socket: TcpStream,
         controller_rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
     ) -> Device {
-        let (rf_tx, mut rf_rx) = mpsc::channel(2);
+        let (rf_tx, mut rf_rx) = mpsc::unbounded_channel();
         Device {
             id,
             rf_tx,
@@ -238,15 +237,15 @@ impl Device {
                 let mut rf_reader = RfReader::new(socket_rx);
                 let mut rf_writer = RfWriter::new(socket_tx);
 
-                loop {
-                    select! {
-                        result = rf_reader.read() => {
+                let result: Result<((), ())> = futures::future::try_join(
+                    async {
+                        loop {
                             // Replace the sender identifier in the packet
                             // with the assigned number for the RF connection.
                             // TODO: currently the generated API does not allow
                             // modifying the parsed fields so the change needs to be
                             // applied to the unparsed packet.
-                            let mut packet_bytes = result?;
+                            let mut packet_bytes = rf_reader.read().await?;
                             packet_bytes[0..2].copy_from_slice(&id.to_le_bytes());
 
                             // Parse the input packet.
@@ -255,28 +254,44 @@ impl Device {
                             // Forward the packet to other devices.
                             controller_rf_tx.send(packet)?;
                         }
-                        result = rf_rx.recv() => {
+                    },
+                    async {
+                        loop {
                             // Forward the packet to the socket connection.
                             use packets::rf::Packet;
-                            let packet = result.ok_or(anyhow::anyhow!("rf_rx channel closed"))?;
+                            let packet = rf_rx
+                                .recv()
+                                .await
+                                .ok_or(anyhow::anyhow!("rf_rx channel closed"))?;
                             rf_writer.write(&packet.to_vec()).await?;
                         }
-                    }
-                }
+                    },
+                )
+                .await;
+
+                result?;
+                Ok(())
             }),
         }
     }
 }
 
+#[derive(Default)]
 struct Scene {
     next_id: u16,
-    rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
+    waker: Option<std::task::Waker>,
     devices: [Option<Device>; MAX_DEVICES],
 }
 
 impl Scene {
-    fn new(rf_tx: mpsc::UnboundedSender<rf::RfPacket>) -> Scene {
-        Scene { next_id: 0, rf_tx, devices: Default::default() }
+    fn new() -> Scene {
+        Default::default()
+    }
+
+    fn wake(&mut self) {
+        if let Some(waker) = self.waker.take() {
+            waker.wake()
+        }
     }
 
     fn add_device(&mut self, builder: impl FnOnce(Id) -> Device) -> Result<Id> {
@@ -284,6 +299,7 @@ impl Scene {
             if self.devices[n].is_none() {
                 self.devices[n] = Some(builder(self.next_id));
                 self.next_id += 1;
+                self.wake();
                 return Ok(n as Id);
             }
         }
@@ -296,7 +312,8 @@ impl Scene {
         for other_n in 0..MAX_DEVICES {
             let Some(ref device) = self.devices[other_n] else { continue };
             assert!(n != other_n);
-            self.rf_tx
+            device
+                .rf_tx
                 .send(
                     rf::DeactivateNotificationBuilder {
                         reason: rf::DeactivateReason::RfLinkLoss,
@@ -311,7 +328,24 @@ impl Scene {
         }
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+    fn send(&self, packet: &rf::RfPacket) -> Result<()> {
+        for n in 0..MAX_DEVICES {
+            let Some(ref device) = self.devices[n] else { continue };
+            if packet.get_sender() != device.id
+                && (packet.get_receiver() == u16::MAX || packet.get_receiver() == device.id)
+            {
+                device.rf_tx.send(packet.to_owned())?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Future for Scene {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         for n in 0..MAX_DEVICES {
             let dropped = match self.devices[n] {
                 Some(ref mut device) => match device.task.as_mut().poll(cx) {
@@ -328,20 +362,9 @@ impl Scene {
                 self.disconnect(n)
             }
         }
+        self.wake();
+        self.waker = Some(cx.waker().clone());
         Poll::Pending
-    }
-
-    async fn send(&self, packet: &rf::RfPacket) -> Result<()> {
-        for n in 0..MAX_DEVICES {
-            let Some(ref device) = self.devices[n] else { continue };
-            if packet.get_sender() != device.id
-                && (packet.get_receiver() == u16::MAX || packet.get_receiver() == device.id)
-            {
-                device.rf_tx.send(packet.to_owned()).await?;
-            }
-        }
-
-        Ok(())
     }
 }
 
@@ -363,7 +386,7 @@ async fn run() -> Result<()> {
     let rf_listener =
         TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, opt.rf_port)).await?;
     let (rf_tx, mut rf_rx) = mpsc::unbounded_channel();
-    let mut scene = Scene::new(rf_tx.clone());
+    let mut scene = Scene::new();
     println!("Listening for NCI connections at address 127.0.0.1:{}", opt.nci_port);
     println!("Listening for RF connections at address 127.0.0.1:{}", opt.rf_port);
     loop {
@@ -384,10 +407,10 @@ async fn run() -> Result<()> {
                     Err(err) => println!("Failed to accept RF connection from {}: {}", addr, err)
                 }
             },
-            _ = poll_fn(|cx| scene.poll(cx)) => (),
+            _ = &mut scene => (),
             result = rf_rx.recv() => {
                 let packet = result.ok_or(anyhow::anyhow!("rf_rx channel closed"))?;
-                scene.send(&packet).await?
+                scene.send(&packet)?
             }
         }
     }

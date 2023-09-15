@@ -1234,7 +1234,7 @@ impl Controller {
         id: u16,
         nci_reader: NciReader,
         nci_writer: NciWriter,
-        mut rf_rx: mpsc::Receiver<rf::RfPacket>,
+        mut rf_rx: mpsc::UnboundedReceiver<rf::RfPacket>,
         rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
     ) -> Result<()> {
         // Local controller state.
