@@ -1101,7 +1101,7 @@ impl Controller {
                 return Ok(());
             }
 
-            println!("+ poll");
+            //println!("+ poll");
 
             // [NCI] 5.2.2 State RFST_DISCOVERY
             //
@@ -1138,7 +1138,6 @@ impl Controller {
         time::sleep(Duration::from_millis(POLL_RESPONSE_TIMEOUT)).await;
 
         let mut state = self.state.lock().await;
-        println!(" > received {} poll response(s)", state.rf_poll_responses.len());
 
         // Check if device was activated in Listen mode during
         // the poll interval, or if the discovery got cancelled.
@@ -1162,6 +1161,8 @@ impl Controller {
             let rf_interface = state.select_interface(RfMode::Poll, rf_protocol);
             return self.activate_poll_interface(&mut state, 0, rf_protocol, rf_interface).await;
         }
+
+        println!(" > received {} poll response(s)", state.rf_poll_responses.len());
 
         // While polling, if the NFCC discovers more than one Remote NFC
         // Endpoint, or a Remote NFC Endpoint that supports more than one RF
