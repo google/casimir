@@ -49,7 +49,7 @@ pub enum LogicalConnection {
 /// The state WaitForAllDiscoveries is not represented as it is implied
 /// by the discovery routine.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code, missing_docs)]
+#[allow(missing_docs)]
 pub enum RfState {
     Idle,
     Discovery,
@@ -77,7 +77,7 @@ pub enum RfState {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code, missing_docs)]
+#[allow(missing_docs)]
 pub enum RfMode {
     Poll,
     Listen,
@@ -106,10 +106,8 @@ pub struct State {
 
 /// State of an NFCC instance.
 pub struct Controller {
-    #[allow(dead_code)]
     id: u16,
     nci_writer: NciWriter,
-    #[allow(dead_code)]
     rf_tx: mpsc::Sender<rf::RfPacket>,
     state: Mutex<State>,
 }
@@ -190,12 +188,10 @@ impl Controller {
         self.nci_writer.write(&packet.into().to_vec()).await
     }
 
-    #[allow(dead_code)]
     async fn send_data(&self, packet: impl Into<nci::DataPacket>) -> Result<()> {
         self.nci_writer.write(&packet.into().to_vec()).await
     }
 
-    #[allow(dead_code)]
     async fn send_rf(&self, packet: impl Into<rf::RfPacket>) -> Result<()> {
         self.rf_tx.send(packet.into()).await?;
         Ok(())
