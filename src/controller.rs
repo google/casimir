@@ -206,6 +206,22 @@ impl Controller {
     async fn core_reset(&self, cmd: nci::CoreResetCommand) -> Result<()> {
         println!("+ core_reset_cmd({:?})", cmd.get_reset_type());
 
+        let mut state = self.state.lock().await;
+
+        match cmd.get_reset_type() {
+            nci::ResetType::KeepConfig => (),
+            nci::ResetType::ResetConfig => state.config_parameters.clear()
+        }
+
+        for i in 0..MAX_LOGICAL_CONNECTIONS {
+            state.logical_connections[i as usize] = None;
+        }
+
+        state.discover_map.clear();
+        state.discover_configuration.clear();
+        state.rf_state = RfState::Idle;
+        state.rf_poll_responses.clear();
+
         self.send_control(nci::CoreResetResponseBuilder { status: nci::Status::Ok }).await?;
 
         self.send_control(nci::CoreResetNotificationBuilder {
