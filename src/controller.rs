@@ -14,12 +14,12 @@
 
 //! Implementation of the NFCC.
 
-use crate::packets::nci::Packet;
 use crate::packets::{nci, rf};
 use crate::NciReader;
 use crate::NciWriter;
 use anyhow::Result;
 use core::time::Duration;
+use pdl_runtime::Packet;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use tokio::sync::mpsc;
@@ -210,7 +210,7 @@ impl Controller {
 
         match cmd.get_reset_type() {
             nci::ResetType::KeepConfig => (),
-            nci::ResetType::ResetConfig => state.config_parameters.clear()
+            nci::ResetType::ResetConfig => state.config_parameters.clear(),
         }
 
         for i in 0..MAX_LOGICAL_CONNECTIONS {
@@ -871,7 +871,7 @@ impl Controller {
                 id: cmd.get_sender(),
                 rf_protocol: *rf_protocol,
                 rf_technology: rf::Technology::NfcA,
-                rf_technology_specific_parameters: nci::Packet::to_vec(
+                rf_technology_specific_parameters: pdl_runtime::Packet::to_vec(
                     nci::NfcAPollModeTechnologySpecificParametersBuilder {
                         sens_res,
                         nfcid1: cmd.get_nfcid1().clone(),
@@ -978,7 +978,7 @@ impl Controller {
             data_exchange_rf_technology_and_mode: nci::RfTechnologyAndMode::NfcAPassivePollMode,
             data_exchange_transmit_bit_rate: nci::BitRate::BitRate106KbitS,
             data_exchange_receive_bit_rate: nci::BitRate::BitRate106KbitS,
-            activation_parameters: nci::Packet::to_vec(
+            activation_parameters: pdl_runtime::Packet::to_vec(
                 nci::NfcAIsoDepPollModeActivationParametersBuilder {
                     rats_response: cmd.get_rats_response().clone(),
                 }

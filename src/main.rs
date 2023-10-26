@@ -258,7 +258,7 @@ impl Device {
                     async {
                         loop {
                             // Forward the packet to the socket connection.
-                            use packets::rf::Packet;
+                            use pdl_runtime::Packet;
                             let packet = rf_rx
                                 .recv()
                                 .await
