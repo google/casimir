@@ -21,6 +21,7 @@ enum GroupId : 4 {
   NFCEE_MANAGEMENT = 0x2,
   NFCC_MANAGEMENT = 0x3,
   TEST_MANAGEMENT = 0x4,
+  PROPRIETARY = 0xF,
 }
 
 enum CoreOpcodeId : 6 {
@@ -65,6 +66,14 @@ enum NfceeOpcodeId : 6 {
   STATUS = 0x2,
   POWER_AND_LINK_CNTRL = 0x3,
   RFU = 0x4..0x3f,
+}
+
+enum ProprietaryOpcodeId : 6 {
+  ANDROID = 0xC,
+}
+
+enum AndroidSubOpcodeId : 8 {
+  OBSERVE_MODE = 0x2,
 }
 
 enum Status : 8 {
@@ -717,4 +726,29 @@ packet NfceeDiscoverCommand : NfceePacket (mt = COMMAND, oid = DISCOVER) {
 packet NfceeDiscoverResponse : NfceePacket (mt = RESPONSE, oid = DISCOVER) {
   status : Status,
   number_of_nfcees : 8,
+}
+
+packet ProprietaryPacket : ControlPacket (gid = PROPRIETARY) {
+  oid : ProprietaryOpcodeId,
+  _reserved_ : 2,
+  _reserved_ : 8,
+  _payload_,
+}
+
+packet AndroidPacket : ProprietaryPacket (oid = ANDROID) {
+  android_sub_oid: AndroidSubOpcodeId,
+  _payload_,
+}
+
+enum ObserveModeEnable : 8 {
+  DISABLE = 0x0,
+  ENABLE = 0x1,
+}
+
+packet AndroidObserveModeCmd : AndroidPacket(mt = COMMAND, android_sub_oid = OBSERVE_MODE) {
+  observe_mode_enable: ObserveModeEnable,
+}
+
+packet AndroidObserveModeRsp : AndroidPacket(mt = RESPONSE, android_sub_oid = OBSERVE_MODE) {
+  status: Status,
 }
