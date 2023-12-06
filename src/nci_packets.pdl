@@ -74,6 +74,7 @@ enum ProprietaryOpcodeId : 6 {
 
 enum AndroidSubOpcodeId : 8 {
   OBSERVE_MODE = 0x2,
+  POLLING_FRAME = 0x3,
 }
 
 enum Status : 8 {
@@ -751,4 +752,22 @@ packet AndroidObserveModeCmd : AndroidPacket(mt = COMMAND, android_sub_oid = OBS
 
 packet AndroidObserveModeRsp : AndroidPacket(mt = RESPONSE, android_sub_oid = OBSERVE_MODE) {
   status: Status,
+}
+
+enum PollingFrameType : 8 {
+  REMOTE_FIELD = 0x0,
+  REQA = 0x1,
+  REQB = 0x2,
+  REQF = 0x3,
+  WUPA = 0x4,
+  WUPB = 0x5,
+  WUPF = 0x6,
+  UNKNOWN = 0x7,
+}
+
+packet AndroidPollingLoopNtf : AndroidPacket(mt = NOTIFICATION, android_sub_oid = POLLING_FRAME) {
+  frametype: PollingFrameType,
+  timestamp: 32,
+  gain: 8,
+  polling_frame_data : 8[],
 }

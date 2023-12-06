@@ -22,6 +22,7 @@ use core::time::Duration;
 use pdl_runtime::Packet;
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time;
@@ -113,6 +114,7 @@ pub struct State {
     pub rf_state: RfState,
     pub rf_poll_responses: Vec<RfPollResponse>,
     pub observe_mode: ObserveModeState,
+    pub start_time: std::time::Instant,
 }
 
 /// State of an NFCC instance.
@@ -190,6 +192,7 @@ impl Controller {
                 rf_state: RfState::Idle,
                 rf_poll_responses: vec![],
                 observe_mode: ObserveModeState::Disable,
+                start_time: Instant::now(),
             }),
         }
     }
@@ -842,8 +845,24 @@ impl Controller {
         if state.rf_state != RfState::Discovery {
             return Ok(());
         }
-
         let technology = cmd.get_technology();
+
+        let ts_u32 = state.start_time.elapsed().as_millis() as u32;
+        let frame_type = match technology {
+            rf::Technology::NfcA => nci::PollingFrameType::Reqa,
+            rf::Technology::NfcB => nci::PollingFrameType::Reqb,
+            rf::Technology::NfcF => nci::PollingFrameType::Reqf,
+            _ => todo!(),
+        };
+
+        self.send_control(nci::AndroidPollingLoopNtfBuilder {
+            timestamp: ts_u32,
+            gain: 2,
+            frametype: frame_type,
+            polling_frame_data: vec![],
+        })
+        .await?;
+
         if state.discover_configuration.iter().any(|config| {
             matches!(
                 (config.technology_and_mode, technology),
