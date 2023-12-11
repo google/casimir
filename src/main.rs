@@ -362,7 +362,6 @@ impl Future for Scene {
                 self.disconnect(n)
             }
         }
-        self.wake();
         self.waker = Some(cx.waker().clone());
         Poll::Pending
     }
