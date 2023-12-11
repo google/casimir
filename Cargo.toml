@@ -15,5 +15,8 @@ thiserror = "1.0.40"
 tokio = { version = "1.22", features = ["full", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 
+[build-dependencies]
+pdl-compiler = "0.2.2"
+
 [features]
 serde = []
