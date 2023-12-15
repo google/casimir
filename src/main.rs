@@ -16,6 +16,7 @@
 
 use anyhow::Result;
 use argh::FromArgs;
+use log::{error, info, warn};
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::pin::Pin;
@@ -351,7 +352,7 @@ impl Future for Scene {
                 Some(ref mut device) => match device.task.as_mut().poll(cx) {
                     Poll::Ready(Ok(_)) => unreachable!(),
                     Poll::Ready(Err(err)) => {
-                        println!("dropping device {}: {}", n, err);
+                        warn!("dropping device {}: {}", n, err);
                         true
                     }
                     Poll::Pending => false,
@@ -379,6 +380,10 @@ struct Opt {
 }
 
 async fn run() -> Result<()> {
+    env_logger::init_from_env(
+        env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "debug"),
+    );
+
     let opt: Opt = argh::from_env();
     let nci_listener =
         TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, opt.nci_port)).await?;
@@ -386,24 +391,24 @@ async fn run() -> Result<()> {
         TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, opt.rf_port)).await?;
     let (rf_tx, mut rf_rx) = mpsc::unbounded_channel();
     let mut scene = Scene::new();
-    println!("Listening for NCI connections at address 127.0.0.1:{}", opt.nci_port);
-    println!("Listening for RF connections at address 127.0.0.1:{}", opt.rf_port);
+    info!("Listening for NCI connections at address 127.0.0.1:{}", opt.nci_port);
+    info!("Listening for RF connections at address 127.0.0.1:{}", opt.rf_port);
     loop {
         select! {
             result = nci_listener.accept() => {
                 let (socket, addr) = result?;
-                println!("Incoming NCI connection from {}", addr);
+                info!("Incoming NCI connection from {}", addr);
                 match scene.add_device(|id| Device::nci(id, socket, rf_tx.clone())) {
-                    Ok(id) => println!("Accepted NCI connection from {} in slot {}", addr, id),
-                    Err(err) => println!("Failed to accept NCI connection from {}: {}", addr, err)
+                    Ok(id) => info!("Accepted NCI connection from {} in slot {}", addr, id),
+                    Err(err) => error!("Failed to accept NCI connection from {}: {}", addr, err)
                 }
             },
             result = rf_listener.accept() => {
                 let (socket, addr) = result?;
-                println!("Incoming RF connection from {}", addr);
+                info!("Incoming RF connection from {}", addr);
                 match scene.add_device(|id| Device::rf(id, socket, rf_tx.clone())) {
-                    Ok(id) => println!("Accepted RF connection from {} in slot {}", addr, id),
-                    Err(err) => println!("Failed to accept RF connection from {}: {}", addr, err)
+                    Ok(id) => info!("Accepted RF connection from {} in slot {}", addr, id),
+                    Err(err) => error!("Failed to accept RF connection from {}: {}", addr, err)
                 }
             },
             _ = &mut scene => (),

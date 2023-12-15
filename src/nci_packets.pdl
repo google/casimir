@@ -318,6 +318,7 @@ enum ConfigParameterId : 8 {
   LF_T3T_IDENTIFIERS_14 = 0x4D,
   LF_T3T_IDENTIFIERS_15 = 0x4E,
   LF_T3T_IDENTIFIERS_16 = 0x4F,
+  LF_T3T_PMM_DEFAULT = 0x51, // deprecated in 2.2
   LF_T3T_MAX = 0x52,
   LF_T3T_FLAGS = 0x53,
   LF_T3T_RD_ALLOWED = 0x55,
