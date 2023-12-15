@@ -73,7 +73,7 @@ enum ProprietaryOpcodeId : 6 {
 }
 
 enum AndroidSubOpcodeId : 8 {
-  OBSERVE_MODE = 0x2,
+  PASSIVE_OBSERVER_MODE = 0x2,
   POLLING_FRAME = 0x3,
 }
 
@@ -741,16 +741,16 @@ packet AndroidPacket : ProprietaryPacket (oid = ANDROID) {
   _payload_,
 }
 
-enum ObserveModeEnable : 8 {
+enum PassiveObserverMode : 8 {
   DISABLE = 0x0,
   ENABLE = 0x1,
 }
 
-packet AndroidObserveModeCmd : AndroidPacket(mt = COMMAND, android_sub_oid = OBSERVE_MODE) {
-  observe_mode_enable: ObserveModeEnable,
+packet AndroidPassiveObserverModeCommand : AndroidPacket(mt = COMMAND, android_sub_oid = PASSIVE_OBSERVER_MODE) {
+  passive_observer_mode: PassiveObserverMode,
 }
 
-packet AndroidObserveModeRsp : AndroidPacket(mt = RESPONSE, android_sub_oid = OBSERVE_MODE) {
+packet AndroidPassiveObserverModeResponse : AndroidPacket(mt = RESPONSE, android_sub_oid = PASSIVE_OBSERVER_MODE) {
   status: Status,
 }
 
@@ -763,11 +763,18 @@ enum PollingFrameType : 8 {
   WUPB = 0x5,
   WUPF = 0x6,
   UNKNOWN = 0x7,
+  REQV = 0x8,
+  WUPV = 0x9,
 }
 
-packet AndroidPollingLoopNtf : AndroidPacket(mt = NOTIFICATION, android_sub_oid = POLLING_FRAME) {
-  frametype: PollingFrameType,
+struct PollingFrame {
+  type: PollingFrameType,
+  _size_(data): 8,
   timestamp: 32,
   gain: 8,
-  polling_frame_data : 8[],
+  data: 8[],
+}
+
+packet AndroidPollingLoopNotification : AndroidPacket(mt = NOTIFICATION, android_sub_oid = POLLING_FRAME) {
+  polling_frames: PollingFrame[],
 }

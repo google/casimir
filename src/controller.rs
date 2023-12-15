@@ -86,14 +86,6 @@ pub enum RfMode {
     Listen,
 }
 
-// Whether Observe Mode is Enabled or Disabled.
-#[derive(Clone, Copy, Debug)]
-#[allow(missing_docs)]
-pub enum ObserveModeState {
-    Enable,
-    Disable,
-}
-
 /// Poll responses received in the context of RF discovery in active
 /// Listen mode.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,7 +105,7 @@ pub struct State {
     pub discover_map: Vec<nci::MappingConfiguration>,
     pub rf_state: RfState,
     pub rf_poll_responses: Vec<RfPollResponse>,
-    pub observe_mode: ObserveModeState,
+    pub passive_observer_mode: nci::PassiveObserverMode,
     pub start_time: std::time::Instant,
 }
 
@@ -191,7 +183,7 @@ impl Controller {
                 discover_configuration: vec![],
                 rf_state: RfState::Idle,
                 rf_poll_responses: vec![],
-                observe_mode: ObserveModeState::Disable,
+                passive_observer_mode: nci::PassiveObserverMode::Disable,
                 start_time: Instant::now(),
             }),
         }
@@ -709,14 +701,17 @@ impl Controller {
         Ok(())
     }
 
-    async fn android_observe_mode(&self, cmd: nci::AndroidObserveModeCmd) -> Result<()> {
+    async fn android_passive_observer_mode(
+        &self,
+        cmd: nci::AndroidPassiveObserverModeCommand,
+    ) -> Result<()> {
         let mut state = self.state.lock().await;
-        state.observe_mode = match cmd.get_observe_mode_enable() {
-            nci::ObserveModeEnable::Enable => ObserveModeState::Enable,
-            nci::ObserveModeEnable::Disable => ObserveModeState::Disable,
-        };
-        println!("+ observe_mode: {:?}", state.observe_mode);
-        self.send_control(nci::AndroidObserveModeRspBuilder { status: nci::Status::Ok }).await?;
+        state.passive_observer_mode = cmd.get_passive_observer_mode();
+        println!("+ passive_observer_mode: {:?}", state.passive_observer_mode);
+        self.send_control(nci::AndroidPassiveObserverModeResponseBuilder {
+            status: nci::Status::Ok,
+        })
+        .await?;
         Ok(())
     }
 
@@ -754,7 +749,9 @@ impl Controller {
             },
             ProprietaryPacket(packet) => match packet.specialize() {
                 AndroidPacket(packet) => match packet.specialize() {
-                    AndroidObserveModeCmd(cmd) => self.android_observe_mode(cmd).await,
+                    AndroidPassiveObserverModeCommand(cmd) => {
+                        self.android_passive_observer_mode(cmd).await
+                    }
                     _ => {
                         unimplemented!("unsupported android oid {:?}", packet.get_android_sub_oid())
                     }
@@ -847,21 +844,34 @@ impl Controller {
         }
         let technology = cmd.get_technology();
 
-        let ts_u32 = state.start_time.elapsed().as_millis() as u32;
-        let frame_type = match technology {
-            rf::Technology::NfcA => nci::PollingFrameType::Reqa,
-            rf::Technology::NfcB => nci::PollingFrameType::Reqb,
-            rf::Technology::NfcF => nci::PollingFrameType::Reqf,
-            _ => todo!(),
-        };
-
-        self.send_control(nci::AndroidPollingLoopNtfBuilder {
-            timestamp: ts_u32,
-            gain: 2,
-            frametype: frame_type,
-            polling_frame_data: vec![],
+        // Android proprietary extension for polling frame notifications.
+        // The NFCC should send the NCI_ANDROID_POLLING_FRAME_NTF to the Host
+        // after each polling loop frame
+        // This notification is independent of whether Passive Observer Mode is
+        // active or not. When Passive Observer Mode is active, the NFCC
+        // should always send this notification before proceeding with the
+        // transaction.
+        self.send_control(nci::AndroidPollingLoopNotificationBuilder {
+            polling_frames: vec![nci::PollingFrame {
+                r#type: match technology {
+                    rf::Technology::NfcA => nci::PollingFrameType::Reqa,
+                    rf::Technology::NfcB => nci::PollingFrameType::Reqb,
+                    rf::Technology::NfcF => nci::PollingFrameType::Reqf,
+                    rf::Technology::NfcV => nci::PollingFrameType::Reqv,
+                },
+                timestamp: state.start_time.elapsed().as_millis() as u32,
+                gain: 2,
+                data: vec![],
+            }],
         })
         .await?;
+
+        // When the Passive Observer Mode is active, the NFCC shall not respond
+        // to any poll requests during the polling loop in Listen Mode, until
+        // explicitly authorized by the Host.
+        if state.passive_observer_mode == nci::PassiveObserverMode::Enable {
+            return Ok(());
+        }
 
         if state.discover_configuration.iter().any(|config| {
             matches!(
@@ -871,9 +881,8 @@ impl Controller {
                     | (nci::RfTechnologyAndMode::NfcFPassiveListenMode, rf::Technology::NfcF)
             )
         }) {
-            match (state.observe_mode, technology) {
-                (ObserveModeState::Enable, _) => (),
-                (ObserveModeState::Disable, rf::Technology::NfcA) => {
+            match technology {
+                rf::Technology::NfcA => {
                     // Configured for T4AT tag emulation.
                     let int_protocol = 0x01;
                     self.send_rf(rf::NfcAPollResponseBuilder {
@@ -885,8 +894,8 @@ impl Controller {
                     })
                     .await?
                 }
-                (ObserveModeState::Disable, rf::Technology::NfcB) => todo!(),
-                (ObserveModeState::Disable, rf::Technology::NfcF) => todo!(),
+                rf::Technology::NfcB => todo!(),
+                rf::Technology::NfcF => todo!(),
                 _ => (),
             }
         }
