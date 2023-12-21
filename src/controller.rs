@@ -15,8 +15,6 @@
 //! Implementation of the NFCC.
 
 use crate::packets::{nci, rf};
-use crate::NciReader;
-use crate::NciWriter;
 use anyhow::Result;
 use core::time::Duration;
 use log::{debug, error, info, trace, warn};
@@ -230,7 +228,7 @@ pub struct State {
 /// State of an NFCC instance.
 pub struct Controller {
     id: u16,
-    nci_writer: NciWriter,
+    nci_writer: nci::Writer,
     rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
     state: Mutex<State>,
 }
@@ -694,7 +692,7 @@ impl Controller {
     /// Create a new NFCC instance with default configuration.
     pub fn new(
         id: u16,
-        nci_writer: NciWriter,
+        nci_writer: nci::Writer,
         rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
     ) -> Controller {
         Controller {
@@ -1984,8 +1982,8 @@ impl Controller {
     /// Main NFCC instance routine.
     pub async fn run(
         id: u16,
-        nci_reader: NciReader,
-        nci_writer: NciWriter,
+        nci_reader: nci::Reader,
+        nci_writer: nci::Writer,
         mut rf_rx: mpsc::UnboundedReceiver<rf::RfPacket>,
         rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
     ) -> Result<()> {
