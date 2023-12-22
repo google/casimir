@@ -19,7 +19,7 @@ use crate::NciReader;
 use crate::NciWriter;
 use anyhow::Result;
 use core::time::Duration;
-use log::{debug, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use pdl_runtime::Packet;
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -28,12 +28,16 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::time;
 
-const NCI_VERSION: nci::NciVersion = nci::NciVersion::Version11;
+const NCI_VERSION: nci::NciVersion = nci::NciVersion::Version20;
+const MANUFACTURER_ID: u8 = 0x02;
+const MANUFACTURER_SPECIFIC_INFORMATION: [u8; 26] =
+    [5, 3, 3, 19, 4, 25, 1, 7, 0, 0, 68, 100, 214, 0, 0, 90, 172, 0, 0, 0, 1, 44, 176, 153, 243, 0];
+
 const MAX_LOGICAL_CONNECTIONS: u8 = 2;
 const MAX_ROUTING_TABLE_SIZE: u16 = 512;
 const MAX_CONTROL_PACKET_PAYLOAD_SIZE: u8 = 255;
 const MAX_DATA_PACKET_PAYLOAD_SIZE: u8 = 255;
-const NUMBER_OF_CREDITS: u8 = 0;
+const NUMBER_OF_CREDITS: u8 = 1;
 const MAX_NFCV_RF_FRAME_SIZE: u16 = 512;
 
 /// Time in milliseconds that Casimir waits for poll responses after
@@ -80,6 +84,14 @@ pub enum RfState {
     },
 }
 
+/// State of the emulated eSE (ST) NFCEE.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum NfceeState {
+    Enabled,
+    Disabled,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub enum RfMode {
@@ -104,6 +116,7 @@ pub struct State {
     pub logical_connections: [Option<LogicalConnection>; MAX_LOGICAL_CONNECTIONS as usize],
     pub discover_configuration: Vec<nci::DiscoverConfiguration>,
     pub discover_map: Vec<nci::MappingConfiguration>,
+    pub nfcee_state: NfceeState,
     pub rf_state: RfState,
     pub rf_poll_responses: Vec<RfPollResponse>,
     pub passive_observer_mode: nci::PassiveObserverMode,
@@ -182,6 +195,7 @@ impl Controller {
                 logical_connections: [None; MAX_LOGICAL_CONNECTIONS as usize],
                 discover_map: vec![],
                 discover_configuration: vec![],
+                nfcee_state: NfceeState::Disabled,
                 rf_state: RfState::Idle,
                 rf_poll_responses: vec![],
                 passive_observer_mode: nci::PassiveObserverMode::Disable,
@@ -238,8 +252,8 @@ impl Controller {
                 nci::ResetType::ResetConfig => nci::ConfigStatus::ConfigReset,
             },
             nci_version: NCI_VERSION,
-            manufacturer_id: 0,
-            manufacturer_specific_information: vec![],
+            manufacturer_id: MANUFACTURER_ID,
+            manufacturer_specific_information: MANUFACTURER_SPECIFIC_INFORMATION.to_vec(),
         })
         .await?;
 
@@ -254,17 +268,17 @@ impl Controller {
             nfcc_features: nci::NfccFeatures {
                 discovery_frequency_configuration: nci::FeatureFlag::Disabled,
                 discovery_configuration_mode: nci::DiscoveryConfigurationMode::DhOnly,
-                hci_network_support: nci::FeatureFlag::Disabled,
-                active_communication_mode: nci::FeatureFlag::Disabled,
-                technology_based_routing: nci::FeatureFlag::Disabled,
-                protocol_based_routing: nci::FeatureFlag::Disabled,
-                aid_based_routing: nci::FeatureFlag::Disabled,
-                system_code_based_routing: nci::FeatureFlag::Disabled,
-                apdu_pattern_based_routing: nci::FeatureFlag::Disabled,
-                forced_nfcee_routing: nci::FeatureFlag::Disabled,
+                hci_network_support: nci::FeatureFlag::Enabled,
+                active_communication_mode: nci::FeatureFlag::Enabled,
+                technology_based_routing: nci::FeatureFlag::Enabled,
+                protocol_based_routing: nci::FeatureFlag::Enabled,
+                aid_based_routing: nci::FeatureFlag::Enabled,
+                system_code_based_routing: nci::FeatureFlag::Enabled,
+                apdu_pattern_based_routing: nci::FeatureFlag::Enabled,
+                forced_nfcee_routing: nci::FeatureFlag::Enabled,
                 battery_off_state: nci::FeatureFlag::Disabled,
-                switched_off_state: nci::FeatureFlag::Disabled,
-                switched_on_substates: nci::FeatureFlag::Disabled,
+                switched_off_state: nci::FeatureFlag::Enabled,
+                switched_on_substates: nci::FeatureFlag::Enabled,
                 rf_configuration_in_switched_off_state: nci::FeatureFlag::Disabled,
                 proprietary_capabilities: 0,
             },
@@ -276,11 +290,12 @@ impl Controller {
             max_nfcv_rf_frame_size: MAX_NFCV_RF_FRAME_SIZE,
             supported_rf_interfaces: vec![
                 nci::RfInterface { interface: nci::RfInterfaceType::Frame, extensions: vec![] },
+                nci::RfInterface { interface: nci::RfInterfaceType::IsoDep, extensions: vec![] },
+                nci::RfInterface { interface: nci::RfInterfaceType::NfcDep, extensions: vec![] },
                 nci::RfInterface {
                     interface: nci::RfInterfaceType::NfceeDirect,
-                    extensions: vec![nci::RfInterfaceExtensionType::FrameAggregated],
+                    extensions: vec![],
                 },
-                nci::RfInterface { interface: nci::RfInterfaceType::NfcDep, extensions: vec![] },
             ],
         })
         .await?;
@@ -707,9 +722,82 @@ impl Controller {
 
         self.send_control(nci::NfceeDiscoverResponseBuilder {
             status: nci::Status::Ok,
-            number_of_nfcees: 0,
+            number_of_nfcees: 1,
         })
         .await?;
+
+        self.send_control(nci::NfceeDiscoverNotificationBuilder {
+            nfcee_id: nci::NfceeId::hci_nfcee(0x86),
+            nfcee_status: nci::NfceeStatus::Disabled,
+            supported_nfcee_protocols: vec![],
+            nfcee_information: vec![nci::NfceeInformation {
+                r#type: nci::NfceeInformationType::HostId,
+                value: vec![0xc0],
+            }],
+            nfcee_supply_power: nci::NfceeSupplyPower::NfccHasNoControl,
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    async fn nfcee_mode_set(&self, cmd: nci::NfceeModeSetCommand) -> Result<()> {
+        info!("[{}] NFCEE_MODE_SET_CMD", self.id);
+        info!("         NFCEE ID: {:?}", cmd.get_nfcee_id());
+        info!("         NFCEE Mode: {:?}", cmd.get_nfcee_mode());
+
+        if cmd.get_nfcee_id() != nci::NfceeId::hci_nfcee(0x86) {
+            warn!("[{}] nfcee_mode_set with invalid nfcee_id", self.id);
+            self.send_control(nci::NfceeModeSetResponseBuilder { status: nci::Status::Ok }).await?;
+            return Ok(());
+        }
+
+        let mut state = self.state.lock().await;
+        state.nfcee_state = match cmd.get_nfcee_mode() {
+            nci::NfceeMode::Enable => NfceeState::Enabled,
+            nci::NfceeMode::Disable => NfceeState::Disabled,
+        };
+
+        self.send_control(nci::NfceeModeSetResponseBuilder { status: nci::Status::Ok }).await?;
+
+        self.send_control(nci::NfceeModeSetNotificationBuilder { status: nci::Status::Ok }).await?;
+
+        if state.nfcee_state == NfceeState::Enabled {
+            // Android host stack expects this notification to know when the
+            // NFCEE completes start-up. The list of information entries is
+            // filled with defaults observed on real phones.
+            self.send_data(nci::DataPacketBuilder {
+                mt: nci::MessageType::Data,
+                conn_id: nci::ConnId::StaticHci,
+                cr: 0,
+                payload: Some(bytes::Bytes::copy_from_slice(&[0x81, 0x43, 0xc0, 0x01])),
+            })
+            .await?;
+
+            self.send_control(nci::RfNfceeDiscoveryReqNotificationBuilder {
+                information_entries: vec![
+                    nci::InformationEntry {
+                        r#type: nci::InformationEntryType::AddDiscoveryRequest,
+                        nfcee_id: nci::NfceeId::hci_nfcee(0x86),
+                        rf_technology_and_mode: nci::RfTechnologyAndMode::NfcFPassiveListenMode,
+                        rf_protocol: nci::RfProtocolType::T3t,
+                    },
+                    nci::InformationEntry {
+                        r#type: nci::InformationEntryType::AddDiscoveryRequest,
+                        nfcee_id: nci::NfceeId::hci_nfcee(0x86),
+                        rf_technology_and_mode: nci::RfTechnologyAndMode::NfcAPassiveListenMode,
+                        rf_protocol: nci::RfProtocolType::IsoDep,
+                    },
+                    nci::InformationEntry {
+                        r#type: nci::InformationEntryType::AddDiscoveryRequest,
+                        nfcee_id: nci::NfceeId::hci_nfcee(0x86),
+                        rf_technology_and_mode: nci::RfTechnologyAndMode::NfcBPassiveListenMode,
+                        rf_protocol: nci::RfProtocolType::IsoDep,
+                    },
+                ],
+            })
+            .await?;
+        }
 
         Ok(())
     }
@@ -760,6 +848,7 @@ impl Controller {
             },
             NfceePacket(packet) => match packet.specialize() {
                 NfceeDiscoverCommand(cmd) => self.nfcee_discover(cmd).await,
+                NfceeModeSetCommand(cmd) => self.nfcee_mode_set(cmd).await,
                 _ => unimplemented!("unsupported nfcee oid {:?}", packet.get_oid()),
             },
             ProprietaryPacket(packet) => match packet.specialize() {
@@ -833,9 +922,50 @@ impl Controller {
         }
     }
 
-    async fn hci_conn_data(&self, _packet: nci::DataPacket) -> Result<()> {
+    async fn hci_conn_data(&self, packet: nci::DataPacket) -> Result<()> {
         info!("[{}] received data on HCI logical connection", self.id);
-        todo!()
+
+        // TODO: parse and understand HCI Control Protocol (HCP)
+        // to accurately respond to the requests. For now it is sufficient
+        // to return hardcoded answers to identified requests.
+        let response = match packet.get_payload() {
+            // ANY_OPEN_PIPE()
+            [0x81, 0x03] => vec![0x81, 0x80],
+            // ANY_GET_PARAMETER(index=1)
+            [0x81, 0x02, 0x01] => vec![0x81, 0x80, 0xd7, 0xfe, 0x65, 0x66, 0xc7, 0xfe, 0x65, 0x66],
+            // ANY_GET_PARAMETER(index=4)
+            [0x81, 0x02, 0x04] => vec![0x81, 0x80, 0x00, 0xc0, 0x01],
+            // ANY_SET_PARAMETER()
+            [0x81, 0x01, 0x03, 0x02, 0xc0]
+            | [0x81, 0x01, 0x03, _, _, _]
+            | [0x81, 0x01, 0x01, _, 0x00, 0x00, 0x00, _, 0x00, 0x00, 0x00] => vec![0x81, 0x80],
+            // ADM_CLEAR_ALL_PIPE()
+            [0x81, 0x14, 0x02, 0x01] => vec![0x81, 0x80],
+            _ => {
+                error!("unimplemented HCI command : {:?}", packet.get_payload());
+                unimplemented!()
+            }
+        };
+
+        self.send_data(nci::DataPacketBuilder {
+            mt: nci::MessageType::Data,
+            conn_id: nci::ConnId::StaticHci,
+            cr: 0,
+            payload: Some(bytes::Bytes::copy_from_slice(&response)),
+        })
+        .await?;
+
+        // Resplenish the credit count for the HCI Connection.
+        self.send_control(
+            nci::CoreConnCreditsNotificationBuilder {
+                connections: vec![nci::ConnectionCredits {
+                    conn_id: nci::ConnId::StaticHci,
+                    credits: 1,
+                }],
+            }
+            .build(),
+        )
+        .await
     }
 
     async fn dynamic_conn_data(&self, _conn_id: u8, _packet: nci::DataPacket) -> Result<()> {

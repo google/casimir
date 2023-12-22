@@ -120,6 +120,14 @@ enum RfDiscoveryId : 8 {
   RFU = ..,
 }
 
+// [NCI] Table 116: NFCEE IDs
+enum NfceeId : 8 {
+  DH = 0x00,
+  HCI_NETWORK = 0x01,
+  NFCEE = 0x10 .. 0x7f,
+  HCI_NFCEE = 0x80 .. 0xfe,
+}
+
 // Generic format for NCI packet headers.
 // The Control and Data packets differ in the reserved fields
 // but the framing information is the same.
@@ -209,8 +217,8 @@ packet CoreInitCommand : CorePacket (mt = COMMAND, oid = INIT) {
 }
 
 enum FeatureFlag : 1 {
-  Enabled = 0,
-  Disabled = 1,
+  DISABLED = 0,
+  ENABLED = 1,
 }
 
 enum DiscoveryConfigurationMode : 2 {
@@ -246,6 +254,7 @@ enum RfInterfaceType : 8 {
   ISO_DEP = 0x02,
   NFC_DEP = 0x03,
   NDEF = 0x06,
+  PROPRIETARY = 0x80..0xfe,
 }
 
 enum RfInterfaceExtensionType : 8 {
@@ -374,6 +383,7 @@ packet CoreGetConfigResponse : CorePacket (mt = RESPONSE, oid = GET_CONFIG) {
   parameters : ConfigParameter[],
 }
 
+// [NCI] Table 133: RF Protocols
 enum RfProtocolType : 8 {
   UNDETERMINED = 0x00,
   T1T = 0x01,
@@ -715,6 +725,26 @@ packet RfDeactivateNotification : RfPacket (mt = NOTIFICATION, oid = DEACTIVATE)
   deactivation_reason : DeactivationReason,
 }
 
+// [NCI] Table 85: TLV Coding for RF Discovery Request from NFCEE
+enum InformationEntryType : 8 {
+  ADD_DISCOVERY_REQUEST = 0x00,
+  REMOVE_DISCOVERY_REQUEST = 0x01,
+}
+
+struct InformationEntry {
+  type : InformationEntryType,
+  _fixed_ = 3 : 8,
+  nfcee_id : NfceeId,
+  rf_technology_and_mode : RfTechnologyAndMode,
+  rf_protocol : RfProtocolType,
+}
+
+// [NCI] Table 84: Notification for RF Discovery Request from NFCEE
+packet RfNfceeDiscoveryReqNotification : RfPacket (mt = NOTIFICATION, oid = NFCEE_DISCOVERY_REQ) {
+  _count_ (information_entries) : 8,
+  information_entries : InformationEntry[],
+}
+
 packet NfceePacket : ControlPacket (gid = NFCEE_MANAGEMENT) {
   oid : NfceeOpcodeId,
   _reserved_ : 2,
@@ -728,6 +758,60 @@ packet NfceeDiscoverCommand : NfceePacket (mt = COMMAND, oid = DISCOVER) {
 packet NfceeDiscoverResponse : NfceePacket (mt = RESPONSE, oid = DISCOVER) {
   status : Status,
   number_of_nfcees : 8,
+}
+
+enum NfceeStatus : 8 {
+  ENABLED = 0x00,
+  DISABLED = 0x01,
+  UNRESPONSIVE = 0x02,
+}
+
+// [NCI] Table 118: TLV Coding for NFCEE Discovery
+enum NfceeInformationType : 8 {
+  HARDWARE_IDENTIFICATION = 0x00,
+  ATR_BYTES = 0x01,
+  T3T_COMMAND_SET_INTERFACE_SUPPLEMENTARY_INFORMATION = 0x02,
+  HOST_ID = 0x03,
+  NDEF_STORAGE = 0x04,
+}
+
+struct NfceeInformation {
+  type : NfceeInformationType,
+  _size_(value) : 8,
+  value : 8[],
+}
+
+enum NfceeSupplyPower : 8 {
+  NFCC_HAS_NO_CONTROL = 0x00,
+  NFCC_HAS_CONTROL = 0x01,
+}
+
+packet NfceeDiscoverNotification : NfceePacket (mt = NOTIFICATION, oid = DISCOVER) {
+  nfcee_id : NfceeId,
+  nfcee_status : NfceeStatus,
+  _count_(supported_nfcee_protocols) : 8,
+  supported_nfcee_protocols : NfceeProtocolType[],
+  _count_(nfcee_information) : 8,
+  nfcee_information : NfceeInformation[],
+  nfcee_supply_power : NfceeSupplyPower,
+}
+
+enum NfceeMode : 8 {
+  DISABLE = 0x00,
+  ENABLE = 0x01,
+}
+
+packet NfceeModeSetCommand : NfceePacket (mt = COMMAND, oid = MODE_SET) {
+  nfcee_id : NfceeId,
+  nfcee_mode : NfceeMode,
+}
+
+packet NfceeModeSetResponse : NfceePacket (mt = RESPONSE, oid = MODE_SET) {
+  status : Status,
+}
+
+packet NfceeModeSetNotification : NfceePacket (mt = NOTIFICATION, oid = MODE_SET) {
+  status : Status,
 }
 
 packet ProprietaryPacket : ControlPacket (gid = PROPRIETARY) {

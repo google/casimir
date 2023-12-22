@@ -52,6 +52,16 @@ pub mod nci {
             *id as usize - 1
         }
     }
+
+    impl NfceeId {
+        pub fn nfcee(id: u8) -> Self {
+            NfceeId::try_from(id).unwrap()
+        }
+
+        pub fn hci_nfcee(id: u8) -> Self {
+            NfceeId::try_from(id).unwrap()
+        }
+    }
 }
 
 /// RF packet parser and serializer.
