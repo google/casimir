@@ -21,7 +21,6 @@ use anyhow::Result;
 use core::time::Duration;
 use log::{debug, error, info, trace, warn};
 use pdl_runtime::Packet;
-use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -33,6 +32,28 @@ const MANUFACTURER_ID: u8 = 0x02;
 const MANUFACTURER_SPECIFIC_INFORMATION: [u8; 26] =
     [5, 3, 3, 19, 4, 25, 1, 7, 0, 0, 68, 100, 214, 0, 0, 90, 172, 0, 0, 0, 1, 44, 176, 153, 243, 0];
 
+/// Read-only configuration parameters
+const PB_ATTRIB_PARAM1: u8 = 0x00;
+const LF_T3T_MAX: u8 = 16;
+const LLCP_VERSION: u8 = 0x00;
+
+/// Writable configuration parameters with default
+/// value defined by the NFCC.
+const TOTAL_DURATION: u16 = 1000;
+const PA_DEVICES_LIMIT: u8 = 255;
+const PB_DEVICES_LIMIT: u8 = 255;
+const PF_DEVICES_LIMIT: u8 = 255;
+const PV_DEVICES_LIMIT: u8 = 255;
+const LA_BIT_FRAME_SDD: u8 = 0x10;
+const LA_PLATFORM_CONFIG: u8 = 0x0c;
+const LA_SEL_INFO: u8 = 0x60; // Supports ISO-DEP and NFC-DEP.
+const LB_SENSB_INFO: u8 = 0x1; // Supports ISO-DEP.
+const LB_SFGI: u8 = 0;
+const LB_FWI_ADC_FO: u8 = 0x00;
+const LF_PROTOCOL_TYPE: u8 = 0x02; // Supports NFC-DEP.
+const LI_A_RATS_TB1: u8 = 0x00;
+const LI_A_RATS_TC1: u8 = 0x00;
+
 const MAX_LOGICAL_CONNECTIONS: u8 = 2;
 const MAX_ROUTING_TABLE_SIZE: u16 = 512;
 const MAX_CONTROL_PACKET_PAYLOAD_SIZE: u8 = 255;
@@ -43,6 +64,89 @@ const MAX_NFCV_RF_FRAME_SIZE: u16 = 512;
 /// Time in milliseconds that Casimir waits for poll responses after
 /// sending a poll command.
 const POLL_RESPONSE_TIMEOUT: u64 = 200;
+
+/// All configuration parameters of the NFCC.
+/// The configuration is filled with default values from the specification
+/// See [NCI] Table 46: Common Parameters for Discovery Configuration
+/// for the format of each parameter and the default value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub struct ConfigParameters {
+    total_duration: u16,
+    /// [NCI] Table 47: Values for CON_DISCOVERY_PARAM.
+    con_discovery_param: u8,
+    power_state: u8,
+    pa_bail_out: u8,
+    pa_devices_limit: u8,
+    pb_afi: u8,
+    pb_bail_out: u8,
+    pb_attrib_param1: u8,
+    /// [NCI] Table 26: Values for PB_SENSB_REQ_PARAM.
+    pb_sensb_req_param: u8,
+    pb_devices_limit: u8,
+    pf_bit_rate: u8,
+    pf_bail_out: u8,
+    pf_devices_limit: u8,
+    pi_b_h_info: Vec<u8>,
+    pi_bit_rate: u8,
+    pn_nfc_dep_psl: u8,
+    pn_atr_req_gen_bytes: Vec<u8>,
+    /// [NCI] Table 30: Values for PN_ATR_REQ_CONFIG.
+    pn_atr_req_config: u8,
+    pv_devices_limit: u8,
+    la_bit_frame_sdd: u8,
+    la_platform_config: u8,
+    /// [NCI] Table 34: LA_SEL_INFO Coding.
+    la_sel_info: u8,
+    la_nfcid1: Vec<u8>,
+    /// [NCI] Table 36: LB_SENSB_INFO Values.
+    lb_sensb_info: u8,
+    lb_nfcid0: [u8; 4],
+    lb_application_data: u32,
+    lb_sfgi: u8,
+    /// [NCI] Table 37: LB_FWI_ADC_FO Values.
+    lb_fwi_adc_fo: u8,
+    lb_bit_rate: u8,
+    lf_t3t_identifiers_1: [u8; 18],
+    lf_t3t_identifiers_2: [u8; 18],
+    lf_t3t_identifiers_3: [u8; 18],
+    lf_t3t_identifiers_4: [u8; 18],
+    lf_t3t_identifiers_5: [u8; 18],
+    lf_t3t_identifiers_6: [u8; 18],
+    lf_t3t_identifiers_7: [u8; 18],
+    lf_t3t_identifiers_8: [u8; 18],
+    lf_t3t_identifiers_9: [u8; 18],
+    lf_t3t_identifiers_10: [u8; 18],
+    lf_t3t_identifiers_11: [u8; 18],
+    lf_t3t_identifiers_12: [u8; 18],
+    lf_t3t_identifiers_13: [u8; 18],
+    lf_t3t_identifiers_14: [u8; 18],
+    lf_t3t_identifiers_15: [u8; 18],
+    lf_t3t_identifiers_16: [u8; 18],
+    lf_t3t_pmm_default: [u8; 8],
+    lf_t3t_max: u8,
+    lf_t3t_flags: u16,
+    lf_t3t_rd_allowed: u8,
+    /// [NCI] Table 39: Supported Protocols for Listen F.
+    lf_protocol_type: u8,
+    li_a_rats_tb1: u8,
+    li_a_hist_by: Vec<u8>,
+    li_b_h_info_resp: Vec<u8>,
+    li_a_bit_rate: u8,
+    li_a_rats_tc1: u8,
+    ln_wt: u8,
+    ln_atr_res_gen_bytes: Vec<u8>,
+    ln_atr_res_config: u8,
+    pacm_bit_rate: u8,
+    /// [NCI] Table 23: RF Field Information Configuration Parameter.
+    rf_field_info: u8,
+    rf_nfcee_action: u8,
+    nfcdep_op: u8,
+    /// [NCI] Table 115: LLCP Version Parameter.
+    llcp_version: u8,
+    /// [NCI] Table 65: Value Field for NFCC Configuration Control.
+    nfcc_config_control: u8,
+}
 
 /// State of an NFCC logical connection with the DH.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -112,7 +216,7 @@ pub struct RfPollResponse {
 /// State of an NFCC instance.
 #[allow(missing_docs)]
 pub struct State {
-    pub config_parameters: HashMap<nci::ConfigParameterId, Vec<u8>>,
+    pub config_parameters: ConfigParameters,
     pub logical_connections: [Option<LogicalConnection>; MAX_LOGICAL_CONNECTIONS as usize],
     pub discover_configuration: Vec<nci::DiscoverConfiguration>,
     pub discover_map: Vec<nci::MappingConfiguration>,
@@ -129,6 +233,413 @@ pub struct Controller {
     nci_writer: NciWriter,
     rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
     state: Mutex<State>,
+}
+
+impl ConfigParameters {
+    fn get(&self, id: nci::ConfigParameterId) -> Result<Vec<u8>> {
+        match id {
+            nci::ConfigParameterId::TotalDuration => Ok(self.total_duration.to_le_bytes().to_vec()),
+            nci::ConfigParameterId::ConDiscoveryParam => {
+                Ok(self.con_discovery_param.to_le_bytes().to_vec())
+            }
+            nci::ConfigParameterId::PowerState => Ok(vec![self.power_state]),
+            nci::ConfigParameterId::PaBailOut => Ok(vec![self.pa_bail_out]),
+            nci::ConfigParameterId::PaDevicesLimit => Ok(vec![self.pa_devices_limit]),
+            nci::ConfigParameterId::PbAfi => Ok(vec![self.pb_afi]),
+            nci::ConfigParameterId::PbBailOut => Ok(vec![self.pb_bail_out]),
+            nci::ConfigParameterId::PbAttribParam1 => Ok(vec![self.pb_attrib_param1]),
+            nci::ConfigParameterId::PbSensbReqParam => Ok(vec![self.pb_sensb_req_param]),
+            nci::ConfigParameterId::PbDevicesLimit => Ok(vec![self.pb_devices_limit]),
+            nci::ConfigParameterId::PfBitRate => Ok(vec![self.pf_bit_rate]),
+            nci::ConfigParameterId::PfBailOut => Ok(vec![self.pf_bail_out]),
+            nci::ConfigParameterId::PfDevicesLimit => Ok(vec![self.pf_devices_limit]),
+            nci::ConfigParameterId::PiBHInfo => Ok(self.pi_b_h_info.clone()),
+            nci::ConfigParameterId::PiBitRate => Ok(vec![self.pi_bit_rate]),
+            nci::ConfigParameterId::PnNfcDepPsl => Ok(vec![self.pn_nfc_dep_psl]),
+            nci::ConfigParameterId::PnAtrReqGenBytes => Ok(self.pn_atr_req_gen_bytes.clone()),
+            nci::ConfigParameterId::PnAtrReqConfig => Ok(vec![self.pn_atr_req_config]),
+            nci::ConfigParameterId::PvDevicesLimit => Ok(vec![self.pv_devices_limit]),
+            nci::ConfigParameterId::LaBitFrameSdd => Ok(vec![self.la_bit_frame_sdd]),
+            nci::ConfigParameterId::LaPlatformConfig => Ok(vec![self.la_platform_config]),
+            nci::ConfigParameterId::LaSelInfo => Ok(vec![self.la_sel_info]),
+            nci::ConfigParameterId::LaNfcid1 => Ok(self.la_nfcid1.clone()),
+            nci::ConfigParameterId::LbSensbInfo => Ok(vec![self.lb_sensb_info]),
+            nci::ConfigParameterId::LbNfcid0 => Ok(self.lb_nfcid0.to_vec()),
+            nci::ConfigParameterId::LbApplicationData => {
+                Ok(self.lb_application_data.to_le_bytes().to_vec())
+            }
+            nci::ConfigParameterId::LbSfgi => Ok(vec![self.lb_sfgi]),
+            nci::ConfigParameterId::LbFwiAdcFo => Ok(vec![self.lb_fwi_adc_fo]),
+            nci::ConfigParameterId::LbBitRate => Ok(vec![self.lb_bit_rate]),
+            nci::ConfigParameterId::LfT3tIdentifiers1 => Ok(self.lf_t3t_identifiers_1.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers2 => Ok(self.lf_t3t_identifiers_2.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers3 => Ok(self.lf_t3t_identifiers_3.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers4 => Ok(self.lf_t3t_identifiers_4.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers5 => Ok(self.lf_t3t_identifiers_5.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers6 => Ok(self.lf_t3t_identifiers_6.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers7 => Ok(self.lf_t3t_identifiers_7.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers8 => Ok(self.lf_t3t_identifiers_8.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers9 => Ok(self.lf_t3t_identifiers_9.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers10 => Ok(self.lf_t3t_identifiers_10.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers11 => Ok(self.lf_t3t_identifiers_11.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers12 => Ok(self.lf_t3t_identifiers_12.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers13 => Ok(self.lf_t3t_identifiers_13.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers14 => Ok(self.lf_t3t_identifiers_14.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers15 => Ok(self.lf_t3t_identifiers_15.to_vec()),
+            nci::ConfigParameterId::LfT3tIdentifiers16 => Ok(self.lf_t3t_identifiers_16.to_vec()),
+            nci::ConfigParameterId::LfT3tPmmDefault => Ok(self.lf_t3t_pmm_default.to_vec()),
+            nci::ConfigParameterId::LfT3tMax => Ok(vec![self.lf_t3t_max]),
+            nci::ConfigParameterId::LfT3tFlags => Ok(self.lf_t3t_flags.to_le_bytes().to_vec()),
+            nci::ConfigParameterId::LfT3tRdAllowed => Ok(vec![self.lf_t3t_rd_allowed]),
+            nci::ConfigParameterId::LfProtocolType => Ok(vec![self.lf_protocol_type]),
+            nci::ConfigParameterId::LiARatsTb1 => Ok(vec![self.li_a_rats_tb1]),
+            nci::ConfigParameterId::LiAHistBy => Ok(self.li_a_hist_by.clone()),
+            nci::ConfigParameterId::LiBHInfoResp => Ok(self.li_b_h_info_resp.clone()),
+            nci::ConfigParameterId::LiABitRate => Ok(vec![self.li_a_bit_rate]),
+            nci::ConfigParameterId::LiARatsTc1 => Ok(vec![self.li_a_rats_tc1]),
+            nci::ConfigParameterId::LnWt => Ok(vec![self.ln_wt]),
+            nci::ConfigParameterId::LnAtrResGenBytes => Ok(self.ln_atr_res_gen_bytes.clone()),
+            nci::ConfigParameterId::LnAtrResConfig => Ok(vec![self.ln_atr_res_config]),
+            nci::ConfigParameterId::PacmBitRate => Ok(vec![self.pacm_bit_rate]),
+            nci::ConfigParameterId::RfFieldInfo => Ok(vec![self.rf_field_info]),
+            nci::ConfigParameterId::RfNfceeAction => Ok(vec![self.rf_nfcee_action]),
+            nci::ConfigParameterId::NfcdepOp => Ok(vec![self.nfcdep_op]),
+            nci::ConfigParameterId::LlcpVersion => Ok(vec![self.llcp_version]),
+            nci::ConfigParameterId::NfccConfigControl => Ok(vec![self.nfcc_config_control]),
+            _ => Err(anyhow::anyhow!("unknown config parameter ID")),
+        }
+    }
+
+    fn set(&mut self, id: nci::ConfigParameterId, value: &[u8]) -> Result<()> {
+        match id {
+            nci::ConfigParameterId::TotalDuration => {
+                self.total_duration = u16::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::ConDiscoveryParam => {
+                self.con_discovery_param = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PowerState => {
+                self.power_state = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PaBailOut => {
+                self.pa_bail_out = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PaDevicesLimit => {
+                self.pa_devices_limit = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PbAfi => {
+                self.pb_afi = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PbBailOut => {
+                self.pb_bail_out = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PbAttribParam1 => {
+                self.pb_attrib_param1 = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PbSensbReqParam => {
+                self.pb_sensb_req_param = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PbDevicesLimit => {
+                self.pb_devices_limit = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PfBitRate => {
+                self.pf_bit_rate = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PfBailOut => {
+                self.pf_bail_out = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PfDevicesLimit => {
+                self.pf_devices_limit = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PiBHInfo => {
+                self.pi_b_h_info = value.to_vec();
+                Ok(())
+            }
+            nci::ConfigParameterId::PiBitRate => {
+                self.pi_bit_rate = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PnNfcDepPsl => {
+                self.pn_nfc_dep_psl = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PnAtrReqGenBytes => {
+                self.pn_atr_req_gen_bytes = value.to_vec();
+                Ok(())
+            }
+            nci::ConfigParameterId::PnAtrReqConfig => {
+                self.pn_atr_req_config = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PvDevicesLimit => {
+                self.pv_devices_limit = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LaBitFrameSdd => {
+                self.la_bit_frame_sdd = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LaPlatformConfig => {
+                self.la_platform_config = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LaSelInfo => {
+                self.la_sel_info = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LaNfcid1 => {
+                self.la_nfcid1 = value.to_vec();
+                Ok(())
+            }
+            nci::ConfigParameterId::LbSensbInfo => {
+                self.lb_sensb_info = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LbNfcid0 => {
+                self.lb_nfcid0 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LbApplicationData => {
+                self.lb_application_data = u32::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LbSfgi => {
+                self.lb_sfgi = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LbFwiAdcFo => {
+                self.lb_fwi_adc_fo = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LbBitRate => {
+                self.lb_bit_rate = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers1 => {
+                self.lf_t3t_identifiers_1 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers2 => {
+                self.lf_t3t_identifiers_2 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers3 => {
+                self.lf_t3t_identifiers_3 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers4 => {
+                self.lf_t3t_identifiers_4 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers5 => {
+                self.lf_t3t_identifiers_5 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers6 => {
+                self.lf_t3t_identifiers_6 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers7 => {
+                self.lf_t3t_identifiers_7 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers8 => {
+                self.lf_t3t_identifiers_8 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers9 => {
+                self.lf_t3t_identifiers_9 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers10 => {
+                self.lf_t3t_identifiers_10 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers11 => {
+                self.lf_t3t_identifiers_11 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers12 => {
+                self.lf_t3t_identifiers_12 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers13 => {
+                self.lf_t3t_identifiers_13 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers14 => {
+                self.lf_t3t_identifiers_14 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers15 => {
+                self.lf_t3t_identifiers_15 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tIdentifiers16 => {
+                self.lf_t3t_identifiers_16 = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tPmmDefault => {
+                self.lf_t3t_pmm_default = value.try_into()?;
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tMax => Err(anyhow::anyhow!("read-only config parameter")),
+            nci::ConfigParameterId::LfT3tFlags => {
+                self.lf_t3t_flags = u16::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LfT3tRdAllowed => {
+                self.lf_t3t_rd_allowed = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LfProtocolType => {
+                self.lf_protocol_type = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LiARatsTb1 => {
+                self.li_a_rats_tb1 = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LiAHistBy => {
+                self.li_a_hist_by = value.to_vec();
+                Ok(())
+            }
+            nci::ConfigParameterId::LiBHInfoResp => {
+                self.li_b_h_info_resp = value.to_vec();
+                Ok(())
+            }
+            nci::ConfigParameterId::LiABitRate => {
+                self.li_a_bit_rate = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LiARatsTc1 => {
+                self.li_a_rats_tc1 = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LnWt => {
+                self.ln_wt = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LnAtrResGenBytes => {
+                self.ln_atr_res_gen_bytes = value.to_vec();
+                Ok(())
+            }
+            nci::ConfigParameterId::LnAtrResConfig => {
+                self.ln_atr_res_config = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::PacmBitRate => {
+                self.pacm_bit_rate = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::RfFieldInfo => {
+                self.rf_field_info = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::RfNfceeAction => {
+                self.rf_nfcee_action = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::NfcdepOp => {
+                self.nfcdep_op = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::LlcpVersion => {
+                self.llcp_version = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            nci::ConfigParameterId::NfccConfigControl => {
+                self.nfcc_config_control = u8::from_le_bytes(value.try_into()?);
+                Ok(())
+            }
+            _ => Err(anyhow::anyhow!("unknown config parameter ID")),
+        }
+    }
+}
+
+impl Default for ConfigParameters {
+    fn default() -> Self {
+        ConfigParameters {
+            total_duration: TOTAL_DURATION,
+            con_discovery_param: 0x01,
+            power_state: 0x02,
+            pa_bail_out: 0x00,
+            pa_devices_limit: PA_DEVICES_LIMIT,
+            pb_afi: 0x00,
+            pb_bail_out: 0x00,
+            pb_attrib_param1: PB_ATTRIB_PARAM1,
+            pb_sensb_req_param: 0x00,
+            pb_devices_limit: PB_DEVICES_LIMIT,
+            pf_bit_rate: 0x01,
+            pf_bail_out: 0x00,
+            pf_devices_limit: PF_DEVICES_LIMIT,
+            pi_b_h_info: vec![],
+            pi_bit_rate: 0x00,
+            pn_nfc_dep_psl: 0x00,
+            pn_atr_req_gen_bytes: vec![],
+            pn_atr_req_config: 0x30,
+            pv_devices_limit: PV_DEVICES_LIMIT,
+            la_bit_frame_sdd: LA_BIT_FRAME_SDD,
+            la_platform_config: LA_PLATFORM_CONFIG,
+            la_sel_info: LA_SEL_INFO,
+            la_nfcid1: vec![0x08, 0x00, 0x00, 0x00],
+            lb_sensb_info: LB_SENSB_INFO,
+            lb_nfcid0: [0x08, 0x00, 0x00, 0x00],
+            lb_application_data: 0x00000000,
+            lb_sfgi: LB_SFGI,
+            lb_fwi_adc_fo: LB_FWI_ADC_FO,
+            lb_bit_rate: 0x00,
+            lf_t3t_identifiers_1: [0; 18],
+            lf_t3t_identifiers_2: [0; 18],
+            lf_t3t_identifiers_3: [0; 18],
+            lf_t3t_identifiers_4: [0; 18],
+            lf_t3t_identifiers_5: [0; 18],
+            lf_t3t_identifiers_6: [0; 18],
+            lf_t3t_identifiers_7: [0; 18],
+            lf_t3t_identifiers_8: [0; 18],
+            lf_t3t_identifiers_9: [0; 18],
+            lf_t3t_identifiers_10: [0; 18],
+            lf_t3t_identifiers_11: [0; 18],
+            lf_t3t_identifiers_12: [0; 18],
+            lf_t3t_identifiers_13: [0; 18],
+            lf_t3t_identifiers_14: [0; 18],
+            lf_t3t_identifiers_15: [0; 18],
+            lf_t3t_identifiers_16: [0; 18],
+            lf_t3t_pmm_default: [0xff; 8],
+            lf_t3t_max: LF_T3T_MAX,
+            lf_t3t_flags: 0x0000,
+            lf_t3t_rd_allowed: 0x00,
+            lf_protocol_type: LF_PROTOCOL_TYPE,
+            li_a_rats_tb1: LI_A_RATS_TB1,
+            li_a_hist_by: vec![],
+            li_b_h_info_resp: vec![],
+            li_a_bit_rate: 0x00,
+            li_a_rats_tc1: LI_A_RATS_TC1,
+            ln_wt: 10,
+            ln_atr_res_gen_bytes: vec![],
+            ln_atr_res_config: 0x30,
+            pacm_bit_rate: 0x01,
+            rf_field_info: 0x00,
+            rf_nfcee_action: 0x01,
+            // [NCI] Table 101: NFC-DEP Operation Parameter.
+            nfcdep_op: 0x1f,
+            llcp_version: LLCP_VERSION,
+            nfcc_config_control: 0x00,
+        }
+    }
 }
 
 impl State {
@@ -191,7 +702,7 @@ impl Controller {
             nci_writer,
             rf_tx,
             state: Mutex::new(State {
-                config_parameters: HashMap::new(),
+                config_parameters: Default::default(),
                 logical_connections: [None; MAX_LOGICAL_CONNECTIONS as usize],
                 discover_map: vec![],
                 discover_configuration: vec![],
@@ -231,7 +742,7 @@ impl Controller {
 
         match cmd.get_reset_type() {
             nci::ResetType::KeepConfig => (),
-            nci::ResetType::ResetConfig => state.config_parameters.clear(),
+            nci::ResetType::ResetConfig => state.config_parameters = Default::default(),
         }
 
         for i in 0..MAX_LOGICAL_CONNECTIONS {
@@ -326,7 +837,9 @@ impl Controller {
                 // with a Status value of STATUS_SEMANTIC_ERROR and no
                 // additional fields.
                 _ => {
-                    state.config_parameters.insert(parameter.id, parameter.value.clone());
+                    if state.config_parameters.set(parameter.id, &parameter.value).is_err() {
+                        invalid_parameters.push(parameter.id)
+                    }
                 }
             }
         }
@@ -363,11 +876,11 @@ impl Controller {
         let mut invalid_parameters = vec![];
         for id in cmd.get_parameters() {
             info!("         ID: {:?}", id);
-            match state.config_parameters.get(id) {
-                Some(value) => {
-                    valid_parameters.push(nci::ConfigParameter { id: *id, value: value.clone() })
+            match state.config_parameters.get(*id) {
+                Ok(value) => {
+                    valid_parameters.push(nci::ConfigParameter { id: *id, value: value.to_vec() })
                 }
-                None => invalid_parameters.push(nci::ConfigParameter { id: *id, value: vec![] }),
+                Err(_) => invalid_parameters.push(nci::ConfigParameter { id: *id, value: vec![] }),
             }
         }
 
