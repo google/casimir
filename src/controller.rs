@@ -752,21 +752,19 @@ impl<'a> Controller<'a> {
         info!("[{}] CORE_RESET_CMD", self.id);
         info!("         ResetType: {:?}", cmd.get_reset_type());
 
-        let state = &mut self.state;
-
         match cmd.get_reset_type() {
             nci::ResetType::KeepConfig => (),
-            nci::ResetType::ResetConfig => state.config_parameters = Default::default(),
+            nci::ResetType::ResetConfig => self.state.config_parameters = Default::default(),
         }
 
         for i in 0..MAX_LOGICAL_CONNECTIONS {
-            state.logical_connections[i as usize] = None;
+            self.state.logical_connections[i as usize] = None;
         }
 
-        state.discover_map.clear();
-        state.discover_configuration.clear();
-        state.rf_state = RfState::Idle;
-        state.rf_poll_responses.clear();
+        self.state.discover_map.clear();
+        self.state.discover_configuration.clear();
+        self.state.rf_state = RfState::Idle;
+        self.state.rf_poll_responses.clear();
 
         self.send_control(nci::CoreResetResponseBuilder { status: nci::Status::Ok }).await?;
 
@@ -831,7 +829,6 @@ impl<'a> Controller<'a> {
     async fn core_set_config(&mut self, cmd: nci::CoreSetConfigCommand) -> Result<()> {
         info!("[{}] CORE_SET_CONFIG_CMD", self.id);
 
-        let state = &mut self.state;
         let mut invalid_parameters = vec![];
         for parameter in cmd.get_parameters().iter() {
             info!("         Type: {:?}", parameter.id);
@@ -851,7 +848,7 @@ impl<'a> Controller<'a> {
                 // with a Status value of STATUS_SEMANTIC_ERROR and no
                 // additional fields.
                 _ => {
-                    if state.config_parameters.set(parameter.id, &parameter.value).is_err() {
+                    if self.state.config_parameters.set(parameter.id, &parameter.value).is_err() {
                         invalid_parameters.push(parameter.id)
                     }
                 }
@@ -885,12 +882,11 @@ impl<'a> Controller<'a> {
     async fn core_get_config(&mut self, cmd: nci::CoreGetConfigCommand) -> Result<()> {
         info!("[{}] CORE_GET_CONFIG_CMD", self.id);
 
-        let state = &mut self.state;
         let mut valid_parameters = vec![];
         let mut invalid_parameters = vec![];
         for id in cmd.get_parameters() {
             info!("         ID: {:?}", id);
-            match state.config_parameters.get(*id) {
+            match self.state.config_parameters.get(*id) {
                 Ok(value) => {
                     valid_parameters.push(nci::ConfigParameter { id: *id, value: value.to_vec() })
                 }
@@ -924,12 +920,11 @@ impl<'a> Controller<'a> {
     async fn core_conn_create(&mut self, cmd: nci::CoreConnCreateCommand) -> Result<()> {
         info!("[{}] CORE_CONN_CREATE_CMD", self.id);
 
-        let state = &mut self.state;
         let result: std::result::Result<u8, nci::Status> = (|| {
             // Retrieve an unused connection ID for the logical connection.
             let conn_id = {
                 (0..MAX_LOGICAL_CONNECTIONS)
-                    .find(|conn_id| state.logical_connections[*conn_id as usize].is_none())
+                    .find(|conn_id| self.state.logical_connections[*conn_id as usize].is_none())
                     .ok_or(nci::Status::Rejected)?
             };
 
@@ -970,12 +965,17 @@ impl<'a> Controller<'a> {
             // The combination of Destination Type and Destination Specific
             // Parameters SHALL uniquely identify a single destination for the
             // Logical Connection.
-            if state.logical_connections.iter().any(|c| c.as_ref() == Some(&logical_connection)) {
+            if self
+                .state
+                .logical_connections
+                .iter()
+                .any(|c| c.as_ref() == Some(&logical_connection))
+            {
                 return Err(nci::Status::Rejected);
             }
 
             // Create the connection.
-            state.logical_connections[conn_id as usize] = Some(logical_connection);
+            self.state.logical_connections[conn_id as usize] = Some(logical_connection);
 
             Ok(conn_id)
         })();
@@ -1002,7 +1002,6 @@ impl<'a> Controller<'a> {
     async fn core_conn_close(&mut self, cmd: nci::CoreConnCloseCommand) -> Result<()> {
         info!("[{}] CORE_CONN_CLOSE_CMD", self.id);
 
-        let state = &mut self.state;
         let conn_id = match cmd.get_conn_id() {
             nci::ConnId::StaticRf | nci::ConnId::StaticHci => {
                 warn!("[{}] core_conn_close called with static conn_id", self.id);
@@ -1016,7 +1015,7 @@ impl<'a> Controller<'a> {
         };
 
         let status = if conn_id >= MAX_LOGICAL_CONNECTIONS
-            || state.logical_connections[conn_id as usize].is_none()
+            || self.state.logical_connections[conn_id as usize].is_none()
         {
             // If there is no connection associated to the Conn ID in the CORE_CONN_CLOSE_CMD, the
             // NFCC SHALL reject the connection closure request by sending a CORE_CONN_CLOSE_RSP
@@ -1026,7 +1025,7 @@ impl<'a> Controller<'a> {
             // When it receives a CORE_CONN_CLOSE_CMD for an existing connection, the NFCC SHALL
             // accept the connection closure request by sending a CORE_CONN_CLOSE_RSP with a Status of
             // STATUS_OK, and the Logical Connection is closed.
-            state.logical_connections[conn_id as usize] = None;
+            self.state.logical_connections[conn_id as usize] = None;
             nci::Status::Ok
         };
 
@@ -1051,8 +1050,7 @@ impl<'a> Controller<'a> {
     async fn rf_discover_map(&mut self, cmd: nci::RfDiscoverMapCommand) -> Result<()> {
         info!("[{}] RF_DISCOVER_MAP_CMD", self.id);
 
-        let state = &mut self.state;
-        state.discover_map.clone_from(cmd.get_mapping_configurations());
+        self.state.discover_map.clone_from(cmd.get_mapping_configurations());
         self.send_control(nci::RfDiscoverMapResponseBuilder { status: nci::Status::Ok }).await?;
 
         Ok(())
@@ -1092,9 +1090,8 @@ impl<'a> Controller<'a> {
             info!("         TechMode: {:?}", config.technology_and_mode);
         }
 
-        let state = &mut self.state;
-        if state.rf_state != RfState::Idle {
-            warn!("[{}] rf_discover received in {:?} state", self.id, state.rf_state);
+        if self.state.rf_state != RfState::Idle {
+            warn!("[{}] rf_discover received in {:?} state", self.id, self.state.rf_state);
             self.send_control(nci::RfDiscoverResponseBuilder {
                 status: nci::Status::SemanticError,
             })
@@ -1102,8 +1099,8 @@ impl<'a> Controller<'a> {
             return Ok(());
         }
 
-        state.discover_configuration.clone_from(cmd.get_configurations());
-        state.rf_state = RfState::Discovery;
+        self.state.discover_configuration.clone_from(cmd.get_configurations());
+        self.state.rf_state = RfState::Discovery;
 
         self.send_control(nci::RfDiscoverResponseBuilder { status: nci::Status::Ok }).await?;
 
@@ -1116,10 +1113,8 @@ impl<'a> Controller<'a> {
         info!("         Protocol: {:?}", cmd.get_rf_protocol());
         info!("         Interface: {:?}", cmd.get_rf_interface());
 
-        let state = &mut self.state;
-
-        if state.rf_state != RfState::WaitForHostSelect {
-            warn!("[{}] rf_discover_select received in {:?} state", self.id, state.rf_state);
+        if self.state.rf_state != RfState::WaitForHostSelect {
+            warn!("[{}] rf_discover_select received in {:?} state", self.id, self.state.rf_state);
             self.send_control(nci::RfDiscoverSelectResponseBuilder {
                 status: nci::Status::SemanticError,
             })
@@ -1142,7 +1137,7 @@ impl<'a> Controller<'a> {
         // If the RF Discovery ID, RF Protocol or RF Interface is not valid,
         // the NFCC SHALL respond with RF_DISCOVER_SELECT_RSP with a Status of
         // STATUS_REJECTED.
-        if rf_discovery_id >= state.rf_poll_responses.len() {
+        if rf_discovery_id >= self.state.rf_poll_responses.len() {
             warn!("[{}] rf_discover_select with invalid rf_discovery_id", self.id);
             self.send_control(nci::RfDiscoverSelectResponseBuilder {
                 status: nci::Status::Rejected,
@@ -1151,7 +1146,8 @@ impl<'a> Controller<'a> {
             return Ok(());
         }
 
-        if cmd.get_rf_protocol() != state.rf_poll_responses[rf_discovery_id].rf_protocol.into() {
+        if cmd.get_rf_protocol() != self.state.rf_poll_responses[rf_discovery_id].rf_protocol.into()
+        {
             warn!("[{}] rf_discover_select with invalid rf_protocol", self.id);
             self.send_control(nci::RfDiscoverSelectResponseBuilder {
                 status: nci::Status::Rejected,
@@ -1180,8 +1176,7 @@ impl<'a> Controller<'a> {
 
         use nci::DeactivationType::*;
 
-        let state = &mut self.state;
-        let (status, mut next_state) = match (state.rf_state, cmd.get_deactivation_type()) {
+        let (status, mut next_state) = match (self.state.rf_state, cmd.get_deactivation_type()) {
             (RfState::Idle, _) => (nci::Status::SemanticError, RfState::Idle),
             (RfState::Discovery, IdleMode) => (nci::Status::Ok, RfState::Idle),
             (RfState::Discovery, _) => (nci::Status::SemanticError, RfState::Discovery),
@@ -1191,7 +1186,7 @@ impl<'a> Controller<'a> {
             }
             (RfState::PollActive { .. }, Discovery) => (nci::Status::Ok, RfState::Discovery),
             (RfState::ListenSleep { .. }, IdleMode) => (nci::Status::Ok, RfState::Idle),
-            (RfState::ListenSleep { .. }, _) => (nci::Status::SemanticError, state.rf_state),
+            (RfState::ListenSleep { .. }, _) => (nci::Status::SemanticError, self.state.rf_state),
             (RfState::ListenActive { .. }, IdleMode) => (nci::Status::Ok, RfState::Idle),
             (RfState::ListenActive { id, .. }, SleepMode | SleepAfMode) => {
                 (nci::Status::Ok, RfState::ListenSleep { id })
@@ -1203,13 +1198,13 @@ impl<'a> Controller<'a> {
             }
             (RfState::WaitForSelectResponse { .. }, IdleMode) => (nci::Status::Ok, RfState::Idle),
             (RfState::WaitForSelectResponse { .. }, _) => {
-                (nci::Status::SemanticError, state.rf_state)
+                (nci::Status::SemanticError, self.state.rf_state)
             }
         };
 
         // Update the state now to prevent interface activation from
         // completing if a remote device is being selected.
-        (next_state, state.rf_state) = (state.rf_state, next_state);
+        (next_state, self.state.rf_state) = (self.state.rf_state, next_state);
 
         self.send_control(nci::RfDeactivateResponseBuilder { status }).await?;
 
@@ -1284,8 +1279,7 @@ impl<'a> Controller<'a> {
             return Ok(());
         }
 
-        let state = &mut self.state;
-        state.nfcee_state = match cmd.get_nfcee_mode() {
+        self.state.nfcee_state = match cmd.get_nfcee_mode() {
             nci::NfceeMode::Enable => NfceeState::Enabled,
             nci::NfceeMode::Disable => NfceeState::Disabled,
         };
@@ -1294,8 +1288,7 @@ impl<'a> Controller<'a> {
 
         self.send_control(nci::NfceeModeSetNotificationBuilder { status: nci::Status::Ok }).await?;
 
-        let state = &mut self.state;
-        if state.nfcee_state == NfceeState::Enabled {
+        if self.state.nfcee_state == NfceeState::Enabled {
             // Android host stack expects this notification to know when the
             // NFCEE completes start-up. The list of information entries is
             // filled with defaults observed on real phones.
@@ -1357,8 +1350,7 @@ impl<'a> Controller<'a> {
         info!("[{}] ANDROID_PASSIVE_OBSERVE_MODE_CMD", self.id);
         info!("     Mode: {:?}", cmd.get_passive_observe_mode());
 
-        let state = &mut self.state;
-        state.passive_observe_mode = cmd.get_passive_observe_mode();
+        self.state.passive_observe_mode = cmd.get_passive_observe_mode();
         self.send_control(nci::AndroidPassiveObserveModeResponseBuilder {
             status: nci::Status::Ok,
         })
@@ -1436,8 +1428,7 @@ impl<'a> Controller<'a> {
         info!("[{}] received data on RF logical connection", self.id);
 
         // TODO(henrichataing) implement credit based control flow.
-        let state = &mut self.state;
-        match state.rf_state {
+        match self.state.rf_state {
             RfState::PollActive {
                 id,
                 rf_technology,
@@ -1597,8 +1588,7 @@ impl<'a> Controller<'a> {
     async fn poll_command(&mut self, cmd: rf::PollCommand) -> Result<()> {
         trace!("[{}] poll_command()", self.id);
 
-        let state = &mut self.state;
-        if state.rf_state != RfState::Discovery {
+        if self.state.rf_state != RfState::Discovery {
             return Ok(());
         }
         let technology = cmd.get_technology();
@@ -1626,17 +1616,14 @@ impl<'a> Controller<'a> {
         })
         .await?;
 
-        let state = &mut self.state;
-
         // When the Passive Observe Mode is active, the NFCC shall not respond
         // to any poll requests during the polling loop in Listen Mode, until
         // explicitly authorized by the Host.
-        if state.passive_observe_mode == nci::PassiveObserveMode::Enable {
+        if self.state.passive_observe_mode == nci::PassiveObserveMode::Enable {
             return Ok(());
         }
 
-        let state = &mut self.state;
-        if state.discover_configuration.iter().any(|config| {
+        if self.state.discover_configuration.iter().any(|config| {
             matches!(
                 (config.technology_and_mode, technology),
                 (nci::RfTechnologyAndMode::NfcAPassiveListenMode, rf::Technology::NfcA)
@@ -1668,8 +1655,7 @@ impl<'a> Controller<'a> {
     async fn nfca_poll_response(&mut self, cmd: rf::NfcAPollResponse) -> Result<()> {
         info!("[{}] nfca_poll_response()", self.id);
 
-        let state = &mut self.state;
-        if state.rf_state != RfState::Discovery {
+        if self.state.rf_state != RfState::Discovery {
             return Ok(());
         }
 
@@ -1690,7 +1676,7 @@ impl<'a> Controller<'a> {
         let sel_res = int_protocol << 5;
 
         for rf_protocol in rf_protocols {
-            state.add_poll_response(RfPollResponse {
+            self.state.add_poll_response(RfPollResponse {
                 id: cmd.get_sender(),
                 rf_protocol: *rf_protocol,
                 rf_technology: rf::Technology::NfcA,
@@ -1711,8 +1697,7 @@ impl<'a> Controller<'a> {
     async fn t4at_select_command(&mut self, cmd: rf::T4ATSelectCommand) -> Result<()> {
         info!("[{}] t4at_select_command()", self.id);
 
-        let state = &mut self.state;
-        match state.rf_state {
+        match self.state.rf_state {
             RfState::Discovery => (),
             RfState::ListenSleep { id } if id == cmd.get_sender() => (),
             _ => return Ok(()),
@@ -1724,7 +1709,7 @@ impl<'a> Controller<'a> {
         // TODO(henrichataing): use listen mode routing table to decide which
         // interface should be used for the activating device.
 
-        state.rf_state = RfState::ListenActive {
+        self.state.rf_state = RfState::ListenActive {
             id: cmd.get_sender(),
             rf_technology: rf::Technology::NfcA,
             rf_protocol: rf::Protocol::IsoDep,
@@ -1737,11 +1722,11 @@ impl<'a> Controller<'a> {
         let mut rats_response = vec![
             0x78, // TC(1), TB(1), TA(1) transmitted, FSCI=8
             0x80, // TA(1)
-            state.config_parameters.li_a_rats_tb1,
-            state.config_parameters.li_a_rats_tc1,
+            self.state.config_parameters.li_a_rats_tb1,
+            self.state.config_parameters.li_a_rats_tc1,
         ];
 
-        rats_response.extend_from_slice(&state.config_parameters.li_a_hist_by);
+        rats_response.extend_from_slice(&self.state.config_parameters.li_a_hist_by);
 
         self.send_rf(rf::T4ATSelectResponseBuilder {
             receiver: cmd.get_sender(),
@@ -1783,8 +1768,7 @@ impl<'a> Controller<'a> {
     async fn t4at_select_response(&mut self, cmd: rf::T4ATSelectResponse) -> Result<()> {
         info!("[{}] t4at_select_response()", self.id);
 
-        let state = &mut self.state;
-        let (id, rf_discovery_id, rf_interface, rf_protocol) = match state.rf_state {
+        let (id, rf_discovery_id, rf_interface, rf_protocol) = match self.state.rf_state {
             RfState::WaitForSelectResponse {
                 id,
                 rf_discovery_id,
@@ -1799,18 +1783,18 @@ impl<'a> Controller<'a> {
             return Ok(());
         }
 
-        state.rf_state = RfState::PollActive {
+        self.state.rf_state = RfState::PollActive {
             id,
-            rf_protocol: state.rf_poll_responses[rf_discovery_id].rf_protocol,
-            rf_technology: state.rf_poll_responses[rf_discovery_id].rf_technology,
+            rf_protocol: self.state.rf_poll_responses[rf_discovery_id].rf_protocol,
+            rf_technology: self.state.rf_poll_responses[rf_discovery_id].rf_technology,
             rf_interface,
         };
 
         // Save the activation parameters for the RF frame interface
         // implementation. Note: TL is not included in the RATS response
         // and needs to be added manually to the activation parameters.
-        state.rf_activation_parameters = vec![cmd.get_rats_response().len() as u8];
-        state.rf_activation_parameters.extend_from_slice(cmd.get_rats_response());
+        self.state.rf_activation_parameters = vec![cmd.get_rats_response().len() as u8];
+        self.state.rf_activation_parameters.extend_from_slice(cmd.get_rats_response());
 
         info!("[{}] RF_INTF_ACTIVATED_NTF", self.id);
         info!("         DiscoveryID: {:?}", nci::RfDiscoveryId::from_index(rf_discovery_id));
@@ -1850,8 +1834,7 @@ impl<'a> Controller<'a> {
     async fn data_packet(&mut self, data: rf::Data) -> Result<()> {
         info!("[{}] data_packet()", self.id);
 
-        let state = &mut self.state;
-        match (state.rf_state, data.get_protocol()) {
+        match (self.state.rf_state, data.get_protocol()) {
             (
                 RfState::PollActive {
                     id, rf_technology, rf_protocol: rf::Protocol::IsoDep, ..
@@ -1893,8 +1876,7 @@ impl<'a> Controller<'a> {
 
         use rf::DeactivateType::*;
 
-        let state = &mut self.state;
-        let mut next_state = match (state.rf_state, cmd.get_type_()) {
+        let mut next_state = match (self.state.rf_state, cmd.get_type_()) {
             (RfState::PollActive { id, .. }, IdleMode) if id == cmd.get_sender() => RfState::Idle,
             (RfState::PollActive { id, .. }, SleepMode | SleepAfMode) if id == cmd.get_sender() => {
                 RfState::WaitForHostSelect
@@ -1915,15 +1897,15 @@ impl<'a> Controller<'a> {
             (RfState::ListenActive { id, .. }, Discovery) if id == cmd.get_sender() => {
                 RfState::Discovery
             }
-            (_, _) => state.rf_state,
+            (_, _) => self.state.rf_state,
         };
 
         // Update the state now to prevent interface activation from
         // completing if a remote device is being selected.
-        (next_state, state.rf_state) = (state.rf_state, next_state);
+        (next_state, self.state.rf_state) = (self.state.rf_state, next_state);
 
         // Deactivate the active RF interface if applicable.
-        if next_state != state.rf_state {
+        if next_state != self.state.rf_state {
             self.send_control(nci::RfDeactivateNotificationBuilder {
                 deactivation_type: cmd.get_type_().into(),
                 deactivation_reason: cmd.get_reason().into(),
@@ -2007,10 +1989,8 @@ impl<'a> Controller<'a> {
             _ => todo!(),
         }
 
-        let state = &mut self.state;
-
-        state.rf_state = RfState::WaitForSelectResponse {
-            id: state.rf_poll_responses[rf_discovery_id].id,
+        self.state.rf_state = RfState::WaitForSelectResponse {
+            id: self.state.rf_poll_responses[rf_discovery_id].id,
             rf_discovery_id,
             rf_interface,
             rf_protocol: rf_protocol.into(),
@@ -2055,54 +2035,48 @@ impl<'a> Controller<'a> {
     /// Timer handler method. This function is invoked at regular interval
     /// on the NFCC instance and is used to drive internal timers.
     async fn tick(&mut self) -> Result<()> {
-        {
-            let state = &mut self.state;
-            if state.rf_state != RfState::Discovery {
-                return Ok(());
-            }
+        if self.state.rf_state != RfState::Discovery {
+            return Ok(());
+        }
 
-            //info!("[{}] poll", self.id);
+        //info!("[{}] poll", self.id);
 
-            // [NCI] 5.2.2 State RFST_DISCOVERY
-            //
-            // In this state the NFCC stays in Poll Mode and/or Listen Mode (based
-            // on the discovery configuration) until at least one Remote NFC
-            // Endpoint is detected or the RF Discovery Process is stopped by
-            // the DH.
-            //
-            // The following implements the Poll Mode Discovery, Listen Mode
-            // Discover is implicitly implemented in response to poll and
-            // select commands.
+        // [NCI] 5.2.2 State RFST_DISCOVERY
+        //
+        // In this state the NFCC stays in Poll Mode and/or Listen Mode (based
+        // on the discovery configuration) until at least one Remote NFC
+        // Endpoint is detected or the RF Discovery Process is stopped by
+        // the DH.
+        //
+        // The following implements the Poll Mode Discovery, Listen Mode
+        // Discover is implicitly implemented in response to poll and
+        // select commands.
 
-            // RF Discovery is ongoing and no peer device has been discovered
-            // so far. Send a RF poll command for all enabled technologies.
-            state.rf_poll_responses.clear();
-            let state = &self.state;
-            for configuration in state.discover_configuration.iter() {
-                self.send_rf(rf::PollCommandBuilder {
-                    sender: self.id,
-                    receiver: u16::MAX,
-                    protocol: rf::Protocol::Undetermined,
-                    technology: match configuration.technology_and_mode {
-                        nci::RfTechnologyAndMode::NfcAPassivePollMode => rf::Technology::NfcA,
-                        nci::RfTechnologyAndMode::NfcBPassivePollMode => rf::Technology::NfcB,
-                        nci::RfTechnologyAndMode::NfcFPassivePollMode => rf::Technology::NfcF,
-                        nci::RfTechnologyAndMode::NfcVPassivePollMode => rf::Technology::NfcV,
-                        _ => continue,
-                    },
-                })
-                .await?
-            }
+        // RF Discovery is ongoing and no peer device has been discovered
+        // so far. Send a RF poll command for all enabled technologies.
+        self.state.rf_poll_responses.clear();
+        for configuration in self.state.discover_configuration.iter() {
+            self.send_rf(rf::PollCommandBuilder {
+                sender: self.id,
+                receiver: u16::MAX,
+                protocol: rf::Protocol::Undetermined,
+                technology: match configuration.technology_and_mode {
+                    nci::RfTechnologyAndMode::NfcAPassivePollMode => rf::Technology::NfcA,
+                    nci::RfTechnologyAndMode::NfcBPassivePollMode => rf::Technology::NfcB,
+                    nci::RfTechnologyAndMode::NfcFPassivePollMode => rf::Technology::NfcF,
+                    nci::RfTechnologyAndMode::NfcVPassivePollMode => rf::Technology::NfcV,
+                    _ => continue,
+                },
+            })
+            .await?
         }
 
         // Wait for poll responses to return.
         self.run_until(time::sleep(Duration::from_millis(POLL_RESPONSE_TIMEOUT))).await?;
 
-        let state = &mut self.state;
-
         // Check if device was activated in Listen mode during
         // the poll interval, or if the discovery got cancelled.
-        if state.rf_state != RfState::Discovery || state.rf_poll_responses.is_empty() {
+        if self.state.rf_state != RfState::Discovery || self.state.rf_poll_responses.is_empty() {
             return Ok(());
         }
 
@@ -2117,21 +2091,21 @@ impl<'a> Controller<'a> {
         // CORE_GENERIC_ERROR_NTF to the DH with status
         // DISCOVERY_TARGET_ACTIVATION_FAILED and SHALL stay in the
         // RFST_DISCOVERY state.
-        if state.rf_poll_responses.len() == 1 {
-            let rf_protocol = state.rf_poll_responses[0].rf_protocol.into();
-            let rf_interface = state.select_interface(RfMode::Poll, rf_protocol);
+        if self.state.rf_poll_responses.len() == 1 {
+            let rf_protocol = self.state.rf_poll_responses[0].rf_protocol.into();
+            let rf_interface = self.state.select_interface(RfMode::Poll, rf_protocol);
             return self.activate_poll_interface(0, rf_protocol, rf_interface).await;
         }
 
-        debug!("[{}] received {} poll response(s)", self.id, state.rf_poll_responses.len());
+        debug!("[{}] received {} poll response(s)", self.id, self.state.rf_poll_responses.len());
 
         // While polling, if the NFCC discovers more than one Remote NFC
         // Endpoint, or a Remote NFC Endpoint that supports more than one RF
         // Protocol, it SHALL start sending RF_DISCOVER_NTF messages to the DH.
         // At this point, the state is changed to RFST_W4_ALL_DISCOVERIES.
-        state.rf_state = RfState::WaitForHostSelect;
-        let last_index = state.rf_poll_responses.len() - 1;
-        for (index, response) in state.rf_poll_responses.clone().iter().enumerate() {
+        self.state.rf_state = RfState::WaitForHostSelect;
+        let last_index = self.state.rf_poll_responses.len() - 1;
+        for (index, response) in self.state.rf_poll_responses.clone().iter().enumerate() {
             self.send_control(nci::RfDiscoverNotificationBuilder {
                 rf_discovery_id: nci::RfDiscoveryId::from_index(index),
                 rf_protocol: response.rf_protocol.into(),
