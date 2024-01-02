@@ -20,7 +20,7 @@ use log::{error, info, warn};
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::pin::Pin;
+use std::pin::{pin, Pin};
 use std::task::Poll;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -138,7 +138,7 @@ impl Device {
                 let (nci_rx, nci_tx) = socket.into_split();
                 Controller::run(
                     id,
-                    nci::Reader::new(nci_rx),
+                    pin!(nci::Reader::new(nci_rx).into_stream()),
                     nci::Writer::new(nci_tx),
                     rf_rx,
                     controller_rf_tx,
