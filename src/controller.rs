@@ -1316,16 +1316,6 @@ impl Controller {
     ) -> Result<()> {
         // Local controller state.
         let nfcc = Controller::new(id, nci_writer, rf_tx);
-        // Send a Reset notification on controller creation corresponding
-        // to a power on.
-        nfcc.send_control(nci::CoreResetNotificationBuilder {
-            trigger: nci::ResetTrigger::PowerOn,
-            config_status: nci::ConfigStatus::ConfigReset,
-            nci_version: NCI_VERSION,
-            manufacturer_id: 0,
-            manufacturer_specific_information: vec![],
-        })
-        .await?;
 
         // Timer for tick events.
         let mut timer = time::interval(Duration::from_millis(1000));
