@@ -35,7 +35,7 @@ pub mod packets;
 use controller::Controller;
 use packets::{nci, rf};
 
-const MAX_DEVICES: usize = 16;
+const MAX_DEVICES: usize = 128;
 type Id = u16;
 
 /// Read NCI Control and Data packets received on the NCI transport.
@@ -277,11 +277,17 @@ impl Device {
     }
 }
 
-#[derive(Default)]
 struct Scene {
     next_id: u16,
     waker: Option<std::task::Waker>,
     devices: [Option<Device>; MAX_DEVICES],
+}
+
+impl Default for Scene {
+    fn default() -> Self {
+        const NONE: Option<Device> = None;
+        Scene { next_id: 0, waker: None, devices: [NONE; MAX_DEVICES] }
+    }
 }
 
 impl Scene {
