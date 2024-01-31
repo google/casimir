@@ -232,6 +232,7 @@ impl Scene {
                 .rf_tx
                 .send(
                     rf::DeactivateNotificationBuilder {
+                        type_: rf::DeactivateType::Discovery,
                         reason: rf::DeactivateReason::RfLinkLoss,
                         sender: id,
                         receiver: device.id,

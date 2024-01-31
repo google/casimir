@@ -702,7 +702,7 @@ enum DeactivationType : 8 {
   IDLE_MODE = 0x00,
   SLEEP_MODE = 0x01,
   SLEEP_AF_MODE = 0x02,
-  DISCOVER = 0x03,
+  DISCOVERY = 0x03,
 }
 
 enum DeactivationReason : 8 {

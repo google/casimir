@@ -217,6 +217,28 @@ impl TryFrom<nci::RfTechnologyAndMode> for rf::Technology {
     }
 }
 
+impl From<rf::DeactivateType> for nci::DeactivationType {
+    fn from(type_: rf::DeactivateType) -> Self {
+        match type_ {
+            rf::DeactivateType::IdleMode => nci::DeactivationType::IdleMode,
+            rf::DeactivateType::SleepMode => nci::DeactivationType::SleepMode,
+            rf::DeactivateType::SleepAfMode => nci::DeactivationType::SleepAfMode,
+            rf::DeactivateType::Discovery => nci::DeactivationType::Discovery,
+        }
+    }
+}
+
+impl From<nci::DeactivationType> for rf::DeactivateType {
+    fn from(type_: nci::DeactivationType) -> Self {
+        match type_ {
+            nci::DeactivationType::IdleMode => rf::DeactivateType::IdleMode,
+            nci::DeactivationType::SleepMode => rf::DeactivateType::SleepMode,
+            nci::DeactivationType::SleepAfMode => rf::DeactivateType::SleepAfMode,
+            nci::DeactivationType::Discovery => rf::DeactivateType::Discovery,
+        }
+    }
+}
+
 impl From<rf::DeactivateReason> for nci::DeactivationReason {
     fn from(reason: rf::DeactivateReason) -> Self {
         match reason {

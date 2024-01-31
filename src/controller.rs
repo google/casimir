@@ -49,8 +49,8 @@ const LB_SENSB_INFO: u8 = 0x1; // Supports ISO-DEP.
 const LB_SFGI: u8 = 0;
 const LB_FWI_ADC_FO: u8 = 0x00;
 const LF_PROTOCOL_TYPE: u8 = 0x02; // Supports NFC-DEP.
-const LI_A_RATS_TB1: u8 = 0x00;
-const LI_A_RATS_TC1: u8 = 0x00;
+const LI_A_RATS_TB1: u8 = 0x70;
+const LI_A_RATS_TC1: u8 = 0x02;
 
 const MAX_LOGICAL_CONNECTIONS: u8 = 2;
 const MAX_ROUTING_TABLE_SIZE: u16 = 512;
@@ -641,6 +641,18 @@ impl Default for ConfigParameters {
 }
 
 impl State {
+    /// Craft the NFCID1 used by this instance in NFC-A poll responses.
+    /// Returns a dynamically generated NFCID1 (4 byte long and starts with 08h).
+    fn nfcid1(&self) -> Vec<u8> {
+        if self.config_parameters.la_nfcid1.len() == 4
+            && self.config_parameters.la_nfcid1[0] == 0x08
+        {
+            vec![0x08, 186, 7, 99] // TODO(hchataing) pseudo random
+        } else {
+            self.config_parameters.la_nfcid1.clone()
+        }
+    }
+
     /// Select the interface to be preferably used for the selected protocol.
     fn select_interface(
         &self,
@@ -711,12 +723,6 @@ impl Controller {
                 start_time: Instant::now(),
             }),
         }
-    }
-
-    /// Craft the NFCID1 used by this instance in NFC-A poll responses.
-    /// Returns a dynamically generated NFCID1 (4 byte long and starts with 08h).
-    fn nfcid1(&self) -> Vec<u8> {
-        vec![0x08, self.id as u8, (self.id >> 8) as u8, 0]
     }
 
     async fn send_control(&self, packet: impl Into<nci::ControlPacket>) -> Result<()> {
@@ -1141,6 +1147,8 @@ impl Controller {
             return Ok(());
         }
 
+        self.send_control(nci::RfDiscoverSelectResponseBuilder { status: nci::Status::Ok }).await?;
+
         // Send RF select command to the peer to activate the device.
         // The command has varying parameters based on the activated protocol.
         self.activate_poll_interface(
@@ -1169,14 +1177,14 @@ impl Controller {
             (RfState::PollActive { .. }, SleepMode | SleepAfMode) => {
                 (nci::Status::Ok, RfState::WaitForHostSelect)
             }
-            (RfState::PollActive { .. }, Discover) => (nci::Status::Ok, RfState::Discovery),
+            (RfState::PollActive { .. }, Discovery) => (nci::Status::Ok, RfState::Discovery),
             (RfState::ListenSleep { .. }, IdleMode) => (nci::Status::Ok, RfState::Idle),
             (RfState::ListenSleep { .. }, _) => (nci::Status::SemanticError, state.rf_state),
             (RfState::ListenActive { .. }, IdleMode) => (nci::Status::Ok, RfState::Idle),
             (RfState::ListenActive { id, .. }, SleepMode | SleepAfMode) => {
                 (nci::Status::Ok, RfState::ListenSleep { id })
             }
-            (RfState::ListenActive { .. }, Discover) => (nci::Status::Ok, RfState::Discovery),
+            (RfState::ListenActive { .. }, Discovery) => (nci::Status::Ok, RfState::Discovery),
             (RfState::WaitForHostSelect, IdleMode) => (nci::Status::Ok, RfState::Idle),
             (RfState::WaitForHostSelect, _) => {
                 (nci::Status::SemanticError, RfState::WaitForHostSelect)
@@ -1218,7 +1226,8 @@ impl Controller {
                     protocol: rf_protocol,
                     technology: rf_technology,
                     sender: self.id,
-                    reason: rf::DeactivateReason::DhRequest,
+                    type_: cmd.get_deactivation_type().into(),
+                    reason: rf::DeactivateReason::EndpointRequest,
                 })
                 .await?
             }
@@ -1417,6 +1426,48 @@ impl Controller {
                 )
                 .await
             }
+            RfState::PollActive {
+                rf_protocol: rf::Protocol::IsoDep,
+                rf_interface: nci::RfInterfaceType::Frame,
+                ..
+            } => {
+                println!("ISO-DEP frame data {:?}", packet.get_payload());
+                match packet.get_payload() {
+                    // RATS command
+                    // TODO(henrichataing) Send back the response received from
+                    // the peer in the RF packet.
+                    [0xe0, _] => {
+                        self.send_data(nci::DataPacketBuilder {
+                            mt: nci::MessageType::Data,
+                            conn_id: nci::ConnId::StaticRf,
+                            cr: 0,
+                            payload: Some(bytes::Bytes::copy_from_slice(&[120, 128, 112, 2])),
+                        })
+                        .await?
+                    }
+                    // DESELECT command
+                    // TODO(henrichataing) check if the command should be
+                    // forwarded to the peer, and if it warrants a response
+                    [0xc2] => (),
+                    // SLP_REQ command
+                    // No response is expected for this command.
+                    // TODO(henrichataing) forward a deactivation request to
+                    // the peer and deactivate the local interface.
+                    [0x50, 0x00] => (),
+                    _ => unimplemented!(),
+                };
+                // Resplenish the credit count for the RF Connection.
+                self.send_control(
+                    nci::CoreConnCreditsNotificationBuilder {
+                        connections: vec![nci::ConnectionCredits {
+                            conn_id: nci::ConnId::StaticRf,
+                            credits: 1,
+                        }],
+                    }
+                    .build(),
+                )
+                .await
+            }
             RfState::PollActive { rf_protocol, rf_interface, .. }
             | RfState::ListenActive { rf_protocol, rf_interface, .. } => unimplemented!(
                 "unsupported combination of RF protocol {:?} and interface {:?}",
@@ -1542,14 +1593,13 @@ impl Controller {
         }) {
             match technology {
                 rf::Technology::NfcA => {
-                    // Configured for T4AT tag emulation.
-                    let int_protocol = 0x01;
                     self.send_rf(rf::NfcAPollResponseBuilder {
                         protocol: rf::Protocol::Undetermined,
                         receiver: cmd.get_sender(),
                         sender: self.id,
-                        nfcid1: self.nfcid1(),
-                        int_protocol,
+                        nfcid1: state.nfcid1(),
+                        int_protocol: state.config_parameters.la_sel_info >> 5,
+                        bit_frame_sdd: state.config_parameters.la_bit_frame_sdd,
                     })
                     .await?
                 }
@@ -1583,7 +1633,7 @@ impl Controller {
             7 => 0x40,
             10 => 0x80,
             _ => panic!(),
-        };
+        } | cmd.get_bit_frame_sdd() as u16;
         let sel_res = int_protocol << 5;
 
         for rf_protocol in rf_protocols {
@@ -1609,9 +1659,11 @@ impl Controller {
         info!("[{}] t4at_select_command()", self.id);
 
         let mut state = self.state.lock().await;
-        if state.rf_state != RfState::Discovery {
-            return Ok(());
-        }
+        match state.rf_state {
+            RfState::Discovery => (),
+            RfState::ListenSleep { id } if id == cmd.get_sender() => (),
+            _ => return Ok(()),
+        };
 
         // TODO(henrichataing): validate that the protocol and technology are
         // valid for the current discovery settings.
@@ -1626,25 +1678,34 @@ impl Controller {
             rf_interface: nci::RfInterfaceType::IsoDep,
         };
 
+        // [DIGITAL] 14.6.2 RATS Response (Answer To Select)
+        // Construct the response from the values passed in the configuration
+        // parameters. The TL byte is excluded from the response.
+        let mut rats_response = vec![
+            0x78, // TC(1), TB(1), TA(1) transmitted, FSCI=8
+            0x80, // TA(1)
+            state.config_parameters.li_a_rats_tb1,
+            state.config_parameters.li_a_rats_tc1,
+        ];
+
+        rats_response.extend_from_slice(&state.config_parameters.li_a_hist_by);
+
         self.send_rf(rf::T4ATSelectResponseBuilder {
             receiver: cmd.get_sender(),
             sender: self.id,
-            // [DIGITAL] 14.6.2 RATS Response (Answer To Select)
-            // TODO(henrichataing): this value is just a valid default;
-            // construct the RATS response from global capabilities.
-            rats_response: vec![0x2, 0x0],
+            rats_response,
         })
         .await?;
 
         info!("[{}] RF_INTF_ACTIVATED_NTF", self.id);
-        info!("         DiscoveryID: {:?}", nci::RfDiscoveryId::reserved());
+        info!("         DiscoveryID: {:?}", nci::RfDiscoveryId::from_index(0));
         info!("         Interface: ISO-DEP");
         info!("         Protocol: ISO-DEP");
         info!("         ActivationTechnology: NFC_A_PASSIVE_LISTEN");
         info!("         RATS: {}", cmd.get_param());
 
         self.send_control(nci::RfIntfActivatedNotificationBuilder {
-            rf_discovery_id: nci::RfDiscoveryId::reserved(),
+            rf_discovery_id: nci::RfDiscoveryId::from_index(0),
             rf_interface: nci::RfInterfaceType::IsoDep,
             rf_protocol: nci::RfProtocolType::IsoDep,
             activation_rf_technology_and_mode: nci::RfTechnologyAndMode::NfcAPassiveListenMode,
@@ -1768,17 +1829,31 @@ impl Controller {
     async fn deactivate_notification(&self, cmd: rf::DeactivateNotification) -> Result<()> {
         info!("[{}] deactivate_notification()", self.id);
 
+        use rf::DeactivateType::*;
+
         let mut state = self.state.lock().await;
-        let mut next_state = match state.rf_state {
-            RfState::PollActive { id, .. }
-            | RfState::ListenSleep { id }
-            | RfState::ListenActive { id, .. }
-            | RfState::WaitForSelectResponse { id, .. }
+        let mut next_state = match (state.rf_state, cmd.get_type_()) {
+            (RfState::PollActive { id, .. }, IdleMode) if id == cmd.get_sender() => RfState::Idle,
+            (RfState::PollActive { id, .. }, SleepMode | SleepAfMode) if id == cmd.get_sender() => {
+                RfState::WaitForHostSelect
+            }
+            (RfState::PollActive { id, .. }, Discovery) if id == cmd.get_sender() => {
+                RfState::Discovery
+            }
+            (RfState::ListenSleep { id, .. }, IdleMode) if id == cmd.get_sender() => RfState::Idle,
+            (RfState::ListenSleep { id, .. }, Discovery) if id == cmd.get_sender() => {
+                RfState::Discovery
+            }
+            (RfState::ListenActive { id, .. }, IdleMode) if id == cmd.get_sender() => RfState::Idle,
+            (RfState::ListenActive { id, .. }, SleepMode | SleepAfMode)
                 if id == cmd.get_sender() =>
             {
-                RfState::Idle
+                RfState::ListenSleep { id }
             }
-            _ => state.rf_state,
+            (RfState::ListenActive { id, .. }, Discovery) if id == cmd.get_sender() => {
+                RfState::Discovery
+            }
+            (_, _) => state.rf_state,
         };
 
         // Update the state now to prevent interface activation from
@@ -1788,7 +1863,7 @@ impl Controller {
         // Deactivate the active RF interface if applicable.
         if next_state != state.rf_state {
             self.send_control(nci::RfDeactivateNotificationBuilder {
-                deactivation_type: nci::DeactivationType::IdleMode,
+                deactivation_type: cmd.get_type_().into(),
                 deactivation_reason: cmd.get_reason().into(),
             })
             .await?
@@ -1811,8 +1886,9 @@ impl Controller {
             // changed to RFST_LISTEN_ACTIVE.
             T4ATSelectCommand(cmd) => self.t4at_select_command(cmd).await,
             T4ATSelectResponse(cmd) => self.t4at_select_response(cmd).await,
-            Data(cmd) => self.data_packet(cmd).await,
+            SelectCommand(_) => unimplemented!(),
             DeactivateNotification(cmd) => self.deactivate_notification(cmd).await,
+            Data(cmd) => self.data_packet(cmd).await,
             _ => unimplemented!(),
         }
     }
@@ -1837,8 +1913,8 @@ impl Controller {
         info!("[{}] activate_poll_interface({:?})", self.id, rf_interface);
 
         let rf_technology = state.rf_poll_responses[rf_discovery_id].rf_technology;
-        match (rf_interface, rf_technology) {
-            (nci::RfInterfaceType::Frame, rf::Technology::NfcA) => {
+        match (rf_protocol, rf_technology) {
+            (nci::RfProtocolType::T2t, rf::Technology::NfcA) => {
                 self.send_rf(rf::SelectCommandBuilder {
                     sender: self.id,
                     receiver: state.rf_poll_responses[rf_discovery_id].id,
@@ -1847,15 +1923,18 @@ impl Controller {
                 })
                 .await?
             }
-            (nci::RfInterfaceType::IsoDep, rf::Technology::NfcA) => {
+            (nci::RfProtocolType::IsoDep, rf::Technology::NfcA) => {
                 self.send_rf(rf::T4ATSelectCommandBuilder {
                     sender: self.id,
                     receiver: state.rf_poll_responses[rf_discovery_id].id,
-                    param: 0,
+                    // [DIGITAL] 14.6.1.6 The FSD supported by the
+                    // Reader/Writer SHALL be FSD T4AT,MIN
+                    // (set to 256 in Appendix B.6).
+                    param: 0x80,
                 })
                 .await?
             }
-            (nci::RfInterfaceType::NfcDep, rf::Technology::NfcA) => {
+            (nci::RfProtocolType::NfcDep, rf::Technology::NfcA) => {
                 self.send_rf(rf::NfcDepSelectCommandBuilder {
                     sender: self.id,
                     receiver: state.rf_poll_responses[rf_discovery_id].id,
