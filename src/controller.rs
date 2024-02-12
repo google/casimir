@@ -221,7 +221,7 @@ pub struct State {
     pub nfcee_state: NfceeState,
     pub rf_state: RfState,
     pub rf_poll_responses: Vec<RfPollResponse>,
-    pub passive_observer_mode: nci::PassiveObserverMode,
+    pub passive_observe_mode: nci::PassiveObserveMode,
     pub start_time: std::time::Instant,
 }
 
@@ -719,7 +719,7 @@ impl Controller {
                 nfcee_state: NfceeState::Disabled,
                 rf_state: RfState::Idle,
                 rf_poll_responses: vec![],
-                passive_observer_mode: nci::PassiveObserverMode::Disable,
+                passive_observe_mode: nci::PassiveObserveMode::Disable,
                 start_time: Instant::now(),
             }),
         }
@@ -1322,17 +1322,47 @@ impl Controller {
         Ok(())
     }
 
-    async fn android_passive_observer_mode(
+    async fn android_get_caps(&self, _cmd: nci::AndroidGetCapsCommand) -> Result<()> {
+        info!("[{}] ANDROID_GET_CAPS_CMD", self.id);
+        let cap_tlvs = vec![
+            nci::CapTlv { t: nci::CapTlvType::PassiveObserverMode, v: vec![1] },
+            nci::CapTlv { t: nci::CapTlvType::PollingFrameNotification, v: vec![1] },
+        ];
+        self.send_control(nci::AndroidGetCapsResponseBuilder {
+            status: nci::Status::Ok,
+            android_version: 0,
+            tlvs: cap_tlvs,
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn android_passive_observe_mode(
         &self,
-        cmd: nci::AndroidPassiveObserverModeCommand,
+        cmd: nci::AndroidPassiveObserveModeCommand,
     ) -> Result<()> {
-        info!("[{}] ANDROID_PASSIVE_OBSERVER_MODE_CMD", self.id);
-        info!("     Mode: {:?}", cmd.get_passive_observer_mode());
+        info!("[{}] ANDROID_PASSIVE_OBSERVE_MODE_CMD", self.id);
+        info!("     Mode: {:?}", cmd.get_passive_observe_mode());
 
         let mut state = self.state.lock().await;
-        state.passive_observer_mode = cmd.get_passive_observer_mode();
-        self.send_control(nci::AndroidPassiveObserverModeResponseBuilder {
+        state.passive_observe_mode = cmd.get_passive_observe_mode();
+        self.send_control(nci::AndroidPassiveObserveModeResponseBuilder {
             status: nci::Status::Ok,
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn android_query_passive_observe_mode(
+        &self,
+        _cmd: nci::AndroidQueryPassiveObserveModeCommand,
+    ) -> Result<()> {
+        info!("[{}] ANDROID_QUERY_PASSIVE_OBSERVE_MODE_CMD", self.id);
+
+        let state = self.state.lock().await;
+        self.send_control(nci::AndroidQueryPassiveObserveModeResponseBuilder {
+            status: nci::Status::Ok,
+            passive_observe_mode: state.passive_observe_mode,
         })
         .await?;
         Ok(())
@@ -1373,8 +1403,12 @@ impl Controller {
             },
             ProprietaryPacket(packet) => match packet.specialize() {
                 AndroidPacket(packet) => match packet.specialize() {
-                    AndroidPassiveObserverModeCommand(cmd) => {
-                        self.android_passive_observer_mode(cmd).await
+                    AndroidGetCapsCommand(cmd) => self.android_get_caps(cmd).await,
+                    AndroidPassiveObserveModeCommand(cmd) => {
+                        self.android_passive_observe_mode(cmd).await
+                    }
+                    AndroidQueryPassiveObserveModeCommand(cmd) => {
+                        self.android_query_passive_observe_mode(cmd).await
                     }
                     _ => {
                         unimplemented!("unsupported android oid {:?}", packet.get_android_sub_oid())
@@ -1557,8 +1591,8 @@ impl Controller {
         // Android proprietary extension for polling frame notifications.
         // The NFCC should send the NCI_ANDROID_POLLING_FRAME_NTF to the Host
         // after each polling loop frame
-        // This notification is independent of whether Passive Observer Mode is
-        // active or not. When Passive Observer Mode is active, the NFCC
+        // This notification is independent of whether Passive Observe Mode is
+        // active or not. When Passive Observe Mode is active, the NFCC
         // should always send this notification before proceeding with the
         // transaction.
         self.send_control(nci::AndroidPollingLoopNotificationBuilder {
@@ -1569,6 +1603,7 @@ impl Controller {
                     rf::Technology::NfcF => nci::PollingFrameType::Reqf,
                     rf::Technology::NfcV => nci::PollingFrameType::Reqv,
                 },
+                flags: 0,
                 timestamp: state.start_time.elapsed().as_millis() as u32,
                 gain: 2,
                 data: vec![],
@@ -1576,10 +1611,10 @@ impl Controller {
         })
         .await?;
 
-        // When the Passive Observer Mode is active, the NFCC shall not respond
+        // When the Passive Observe Mode is active, the NFCC shall not respond
         // to any poll requests during the polling loop in Listen Mode, until
         // explicitly authorized by the Host.
-        if state.passive_observer_mode == nci::PassiveObserverMode::Enable {
+        if state.passive_observe_mode == nci::PassiveObserveMode::Enable {
             return Ok(());
         }
 
