@@ -31,6 +31,9 @@ fn main() {
         "RF_PACKETS_PREBUILT",
         &PathBuf::from("src/rf_packets.pdl").canonicalize().unwrap(),
     );
+
+    protoc_grpcio::compile_grpc_protos(&["casimir.proto"], &["src/proto"], &"src/proto", None)
+        .expect("gRPC generation failed");
 }
 
 fn install_generated_module(module_name: &str, prebuilt_var: &str, pdl_name: &Path) {
