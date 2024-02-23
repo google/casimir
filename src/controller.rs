@@ -221,6 +221,7 @@ pub struct State {
     pub nfcee_state: NfceeState,
     pub rf_state: RfState,
     pub rf_poll_responses: Vec<RfPollResponse>,
+    pub rf_activation_parameters: Vec<u8>,
     pub passive_observe_mode: nci::PassiveObserveMode,
     pub start_time: std::time::Instant,
 }
@@ -719,6 +720,7 @@ impl Controller {
                 nfcee_state: NfceeState::Disabled,
                 rf_state: RfState::Idle,
                 rf_poll_responses: vec![],
+                rf_activation_parameters: vec![],
                 passive_observe_mode: nci::PassiveObserveMode::Disable,
                 start_time: Instant::now(),
             }),
@@ -1471,23 +1473,26 @@ impl Controller {
                     // TODO(henrichataing) Send back the response received from
                     // the peer in the RF packet.
                     [0xe0, _] => {
+                        warn!("[{}] frame RATS command", self.id);
                         self.send_data(nci::DataPacketBuilder {
                             mt: nci::MessageType::Data,
                             conn_id: nci::ConnId::StaticRf,
                             cr: 0,
-                            payload: Some(bytes::Bytes::copy_from_slice(&[120, 128, 112, 2])),
+                            payload: Some(bytes::Bytes::copy_from_slice(
+                                &state.rf_activation_parameters,
+                            )),
                         })
                         .await?
                     }
                     // DESELECT command
                     // TODO(henrichataing) check if the command should be
                     // forwarded to the peer, and if it warrants a response
-                    [0xc2] => (),
+                    [0xc2] => warn!("[{}] unimplemented frame DESELECT command", self.id),
                     // SLP_REQ command
                     // No response is expected for this command.
                     // TODO(henrichataing) forward a deactivation request to
                     // the peer and deactivate the local interface.
-                    [0x50, 0x00] => (),
+                    [0x50, 0x00] => warn!("[{}] unimplemented frame SLP_REQ command", self.id),
                     _ => unimplemented!(),
                 };
                 // Resplenish the credit count for the RF Connection.
@@ -1788,6 +1793,12 @@ impl Controller {
             rf_interface,
         };
 
+        // Save the activation parameters for the RF frame interface
+        // implementation. Note: TL is not included in the RATS response
+        // and needs to be added manually to the activation parameters.
+        state.rf_activation_parameters = vec![cmd.get_rats_response().len() as u8];
+        state.rf_activation_parameters.extend_from_slice(cmd.get_rats_response());
+
         info!("[{}] RF_INTF_ACTIVATED_NTF", self.id);
         info!("         DiscoveryID: {:?}", nci::RfDiscoveryId::from_index(rf_discovery_id));
         info!("         Interface: {:?}", rf_interface);
@@ -1808,6 +1819,9 @@ impl Controller {
             data_exchange_rf_technology_and_mode: nci::RfTechnologyAndMode::NfcAPassivePollMode,
             data_exchange_transmit_bit_rate: nci::BitRate::BitRate106KbitS,
             data_exchange_receive_bit_rate: nci::BitRate::BitRate106KbitS,
+            // TODO(hchataing) the activation parameters should be empty
+            // when the RF frame interface is used, since the protocol
+            // activation is managed by the DH.
             activation_parameters: pdl_runtime::Packet::to_vec(
                 nci::NfcAIsoDepPollModeActivationParametersBuilder {
                     rats_response: cmd.get_rats_response().clone(),
