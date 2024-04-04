@@ -1609,7 +1609,7 @@ impl Controller {
                     rf::Technology::NfcV => nci::PollingFrameType::Reqv,
                 },
                 flags: 0,
-                timestamp: state.start_time.elapsed().as_millis() as u32,
+                timestamp: (state.start_time.elapsed().as_millis() as u32).to_be_bytes(),
                 gain: 2,
                 data: vec![],
             }],

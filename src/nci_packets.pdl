@@ -889,7 +889,9 @@ struct PollingFrame {
   type: PollingFrameType,
   flags: 8,
   _size_(data): 8,
-  timestamp: 32,
+  // The timestamp is encoded in big-endian byte order,
+  // whereas other NCI definitions are little-endian.
+  timestamp: 8[4],
   gain: 8,
   data: 8[],
 }
