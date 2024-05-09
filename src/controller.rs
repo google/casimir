@@ -1041,7 +1041,7 @@ impl Controller {
         info!("[{}] RF_DISCOVER_MAP_CMD", self.id);
 
         let mut state = self.state.lock().await;
-        state.discover_map = cmd.get_mapping_configurations().clone();
+        state.discover_map.clone_from(cmd.get_mapping_configurations());
         self.send_control(nci::RfDiscoverMapResponseBuilder { status: nci::Status::Ok }).await?;
 
         Ok(())
@@ -1091,7 +1091,7 @@ impl Controller {
             return Ok(());
         }
 
-        state.discover_configuration = cmd.get_configurations().clone();
+        state.discover_configuration.clone_from(cmd.get_configurations());
         state.rf_state = RfState::Discovery;
 
         self.send_control(nci::RfDiscoverResponseBuilder { status: nci::Status::Ok }).await?;
