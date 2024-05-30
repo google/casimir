@@ -173,7 +173,7 @@ impl Device {
                                 .recv()
                                 .await
                                 .ok_or(anyhow::anyhow!("rf_rx channel closed"))?;
-                            rf_writer.write(&packet.to_vec()).await?;
+                            rf_writer.write(&packet.encode_to_vec()?).await?;
                         }
                     },
                 )
