@@ -1643,7 +1643,8 @@ impl<'a> Controller<'a> {
                     })
                     .await?
                 }
-                rf::Technology::NfcB => todo!(),
+                // TODO(b/346715736) implement support for NFC-B technology
+                rf::Technology::NfcB => (),
                 rf::Technology::NfcF => todo!(),
                 _ => (),
             }
