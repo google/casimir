@@ -16,6 +16,7 @@ enum Technology : 8 {
     NFC_B = 1,
     NFC_F = 2,
     NFC_V = 3,
+    RAW = 0x7,
 }
 
 /// Protocol used for data exchange.
@@ -80,6 +81,7 @@ packet RfPacket {
 /// - INVENTORY_REQ Command for NFC-V
 /// - ATR_REQ Command for NFC-ACM
 packet PollCommand : RfPacket (packet_type = POLL_COMMAND) {
+     _payload_,
 }
 
 /// Poll response for an NFC-A Listener.

@@ -1607,11 +1607,12 @@ impl<'a> Controller<'a> {
                     rf::Technology::NfcB => nci::PollingFrameType::Reqb,
                     rf::Technology::NfcF => nci::PollingFrameType::Reqf,
                     rf::Technology::NfcV => nci::PollingFrameType::Reqv,
+                    rf::Technology::Raw => nci::PollingFrameType::Unknown,
                 },
                 flags: 0,
                 timestamp: (self.state.start_time.elapsed().as_millis() as u32).to_be_bytes(),
                 gain: 2,
-                data: vec![],
+                data: cmd.get_payload().to_vec(),
             }],
         })
         .await?;
@@ -2067,6 +2068,7 @@ impl<'a> Controller<'a> {
                     nci::RfTechnologyAndMode::NfcVPassivePollMode => rf::Technology::NfcV,
                     _ => continue,
                 },
+                payload: Some(bytes::Bytes::new()),
             })
             .await?
         }

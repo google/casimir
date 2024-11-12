@@ -102,6 +102,7 @@ class Technology(enum.IntEnum):
     NFC_B = 0x1
     NFC_F = 0x2
     NFC_V = 0x3
+    RAW = 0x7
 
     @staticmethod
     def from_int(v: int) -> Union[int, 'Technology']:
@@ -232,7 +233,7 @@ class RfPacket(Packet):
 
 @dataclass
 class PollCommand(RfPacket):
-    
+    data : bytearray = field(kw_only=True, default_factory=bytearray)
 
     def __post_init__(self):
         self.packet_type = RfPacketType.POLL_COMMAND
@@ -241,15 +242,18 @@ class PollCommand(RfPacket):
     def parse(fields: dict, span: bytes) -> Tuple['PollCommand', bytes]:
         if fields['packet_type'] != RfPacketType.POLL_COMMAND:
             raise Exception("Invalid constraint field values")
+        data = span[0:]
+        fields['data'] = data
         return PollCommand(**fields), span
 
     def serialize(self, payload: bytes = None) -> bytes:
         _span = bytearray()
+        _span.extend(self.data)
         return RfPacket.serialize(self, payload = bytes(_span))
 
     @property
     def size(self) -> int:
-        return 0
+        return len(self.data)
 
 @dataclass
 class NfcAPollResponse(RfPacket):
@@ -426,7 +430,7 @@ class NfcDepSelectResponse(RfPacket):
 
 @dataclass
 class SelectCommand(RfPacket):
-    
+
 
     def __post_init__(self):
         self.packet_type = RfPacketType.SELECT_COMMAND

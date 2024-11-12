@@ -89,7 +89,14 @@ class T4AT:
                         await self.active(response.sender)
                     case _:
                         pass
-                time.sleep(0.150);
+                time.sleep(0.050);
+            except TimeoutError:
+                pass
+            time.sleep(0.050);
+            try:
+                signature = bytes([0x1, 0x2, 0x3, 0x4]);
+                self._write(rf.PollCommand(technology=rf.Technology.NFC_RAW, data=signature))
+                await asyncio.wait_for(self._read(), timeout=1.0)
             except TimeoutError:
                 pass
 
