@@ -1215,6 +1215,7 @@ impl<'a> Controller<'a> {
                 info!("[{}] RF_DEACTIVATE_NTF", self.id);
                 info!("         Type: {:?}", cmd.get_deactivation_type());
                 info!("         Reason: DH_Request");
+                self.field_info(rf::FieldStatus::FieldOff, 255).await?;
                 self.send_control(nci::RfDeactivateNotificationBuilder {
                     deactivation_type: cmd.get_deactivation_type(),
                     deactivation_reason: nci::DeactivationReason::DhRequest,
@@ -1232,6 +1233,7 @@ impl<'a> Controller<'a> {
                     receiver: id,
                     protocol: rf_protocol,
                     technology: rf_technology,
+                    power_level: 255,
                     sender: self.id,
                     type_: cmd.get_deactivation_type().into(),
                     reason: rf::DeactivateReason::EndpointRequest,
@@ -1446,6 +1448,7 @@ impl<'a> Controller<'a> {
                 self.send_rf(rf::DataBuilder {
                     receiver: id,
                     sender: self.id,
+                    power_level: 255,
                     protocol: rf::Protocol::IsoDep,
                     technology: rf_technology,
                     data: packet.get_payload().into(),
@@ -1585,6 +1588,29 @@ impl<'a> Controller<'a> {
         }
     }
 
+    async fn field_info(&mut self, field_status: rf::FieldStatus, power_level: u8) -> Result<()> {
+        if self.state.config_parameters.rf_field_info != 0 {
+            self.send_control(nci::RfFieldInfoNotificationBuilder {
+                rf_field_status: match field_status {
+                    rf::FieldStatus::FieldOn => nci::RfFieldStatus::FieldDetected,
+                    rf::FieldStatus::FieldOff => nci::RfFieldStatus::NoFieldDetected,
+                },
+            })
+            .await?;
+        }
+        self.send_control(nci::AndroidPollingLoopNotificationBuilder {
+            polling_frames: vec![nci::PollingFrame {
+                frame_type: nci::PollingFrameType::RemoteField,
+                flags: 0,
+                timestamp: (self.state.start_time.elapsed().as_micros() as u32).to_be_bytes(),
+                gain: power_level,
+                payload: vec![field_status.into()],
+            }],
+        })
+        .await?;
+        Ok(())
+    }
+
     async fn poll_command(&mut self, cmd: rf::PollCommand) -> Result<()> {
         trace!("[{}] poll_command()", self.id);
 
@@ -1602,7 +1628,7 @@ impl<'a> Controller<'a> {
         // transaction.
         self.send_control(nci::AndroidPollingLoopNotificationBuilder {
             polling_frames: vec![nci::PollingFrame {
-                r#type: match technology {
+                frame_type: match technology {
                     rf::Technology::NfcA => nci::PollingFrameType::Reqa,
                     rf::Technology::NfcB => nci::PollingFrameType::Reqb,
                     rf::Technology::NfcF => nci::PollingFrameType::Reqf,
@@ -1610,9 +1636,9 @@ impl<'a> Controller<'a> {
                     rf::Technology::Raw => nci::PollingFrameType::Unknown,
                 },
                 flags: 0,
-                timestamp: (self.state.start_time.elapsed().as_millis() as u32).to_be_bytes(),
-                gain: 2,
-                data: cmd.get_payload().to_vec(),
+                timestamp: (self.state.start_time.elapsed().as_micros() as u32).to_be_bytes(),
+                gain: cmd.get_power_level(),
+                payload: cmd.get_payload().to_vec(),
             }],
         })
         .await?;
@@ -1638,6 +1664,7 @@ impl<'a> Controller<'a> {
                         protocol: rf::Protocol::Undetermined,
                         receiver: cmd.get_sender(),
                         sender: self.id,
+                        power_level: 255,
                         nfcid1: self.state.nfcid1(),
                         int_protocol: self.state.config_parameters.la_sel_info >> 5,
                         bit_frame_sdd: self.state.config_parameters.la_bit_frame_sdd,
@@ -1733,6 +1760,7 @@ impl<'a> Controller<'a> {
         self.send_rf(rf::T4ATSelectResponseBuilder {
             receiver: cmd.get_sender(),
             sender: self.id,
+            power_level: 255,
             rats_response,
         })
         .await?;
@@ -1907,6 +1935,7 @@ impl<'a> Controller<'a> {
 
         // Deactivate the active RF interface if applicable.
         if next_state != self.state.rf_state {
+            self.field_info(rf::FieldStatus::FieldOff, 255).await?;
             self.send_control(nci::RfDeactivateNotificationBuilder {
                 deactivation_type: cmd.get_type_().into(),
                 deactivation_reason: cmd.get_reason().into(),
@@ -1922,6 +1951,7 @@ impl<'a> Controller<'a> {
 
         match packet.specialize() {
             PollCommand(cmd) => self.poll_command(cmd).await,
+            FieldInfo(cmd) => self.field_info(cmd.get_field_status(), cmd.get_power_level()).await,
             NfcAPollResponse(cmd) => self.nfca_poll_response(cmd).await,
             // [NCI] 5.2.2 State RFST_DISCOVERY
             // If discovered by a Remote NFC Endpoint in Listen mode, once the
@@ -1963,6 +1993,7 @@ impl<'a> Controller<'a> {
                     sender: self.id,
                     receiver: self.state.rf_poll_responses[rf_discovery_id].id,
                     technology: rf::Technology::NfcA,
+                    power_level: 255,
                     protocol: rf::Protocol::T2t,
                 })
                 .await?
@@ -1971,6 +2002,7 @@ impl<'a> Controller<'a> {
                 self.send_rf(rf::T4ATSelectCommandBuilder {
                     sender: self.id,
                     receiver: self.state.rf_poll_responses[rf_discovery_id].id,
+                    power_level: 255,
                     // [DIGITAL] 14.6.1.6 The FSD supported by the
                     // Reader/Writer SHALL be FSD T4AT,MIN
                     // (set to 256 in Appendix B.6).
@@ -1982,6 +2014,7 @@ impl<'a> Controller<'a> {
                 self.send_rf(rf::NfcDepSelectCommandBuilder {
                     sender: self.id,
                     receiver: self.state.rf_poll_responses[rf_discovery_id].id,
+                    power_level: 255,
                     technology: rf::Technology::NfcA,
                     lr: 0,
                 })
@@ -2068,6 +2101,7 @@ impl<'a> Controller<'a> {
                     nci::RfTechnologyAndMode::NfcVPassivePollMode => rf::Technology::NfcV,
                     _ => continue,
                 },
+                power_level: 255,
                 payload: Some(bytes::Bytes::new()),
             })
             .await?

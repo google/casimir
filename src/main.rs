@@ -235,6 +235,7 @@ impl Scene {
                         reason: rf::DeactivateReason::RfLinkLoss,
                         sender: id,
                         receiver: device.id,
+                        power_level: 255,
                         technology: rf::Technology::NfcA,
                         protocol: rf::Protocol::Undetermined,
                     }

@@ -59,6 +59,7 @@ enum RfPacketType : 8 {
     SELECT_COMMAND = 3,
     SELECT_RESPONSE = 4,
     DEACTIVATE_NOTIFICATION = 5,
+    FIELD_INFO = 6,
 }
 
 /// The definition of packets does not aim to reproduce the exact protocol
@@ -71,6 +72,9 @@ packet RfPacket {
     technology: Technology,
     protocol : Protocol,
     packet_type: RfPacketType,
+    // Power level from 0-12 with higher numbers representing stronger field strength.
+    // OxFF represents an unknown or invalid value.
+    power_level: 8,
     _payload_,
 }
 
@@ -81,7 +85,18 @@ packet RfPacket {
 /// - INVENTORY_REQ Command for NFC-V
 /// - ATR_REQ Command for NFC-ACM
 packet PollCommand : RfPacket (packet_type = POLL_COMMAND) {
-     _payload_,
+    _payload_,
+}
+
+/// Whether the RF field of the tag is currently on or off
+/// as defined by RF_FIELD_INFO_NTF
+enum FieldStatus : 8 {
+    FieldOff = 0,
+    FieldOn = 1,
+}
+
+packet FieldInfo : RfPacket (packet_type = FIELD_INFO) {
+    field_status: FieldStatus,
 }
 
 /// Poll response for an NFC-A Listener.

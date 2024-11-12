@@ -728,6 +728,16 @@ packet RfDeactivateNotification : RfPacket (mt = NOTIFICATION, oid = DEACTIVATE)
   deactivation_reason : DeactivationReason,
 }
 
+enum RfFieldStatus : 8 {
+  NO_FIELD_DETECTED = 0,
+  FIELD_DETECTED = 1,
+}
+
+packet RfFieldInfoNotification : RfPacket (mt = NOTIFICATION, oid = FIELD_INFO) {
+  rf_field_status: RfFieldStatus,
+}
+
+
 // [NCI] Table 85: TLV Coding for RF Discovery Request from NFCEE
 enum InformationEntryType : 8 {
   ADD_DISCOVERY_REQUEST = 0x00,
@@ -886,14 +896,14 @@ enum PollingFrameType : 8 {
 }
 
 struct PollingFrame {
-  type: PollingFrameType,
+  frame_type: PollingFrameType,
   flags: 8,
-  _size_(data): 8,
+  _size_(_payload_): 8,
   // The timestamp is encoded in big-endian byte order,
   // whereas other NCI definitions are little-endian.
   timestamp: 8[4],
   gain: 8,
-  data: 8[],
+  _payload_: [+5],
 }
 
 packet AndroidPollingLoopNotification : AndroidPacket(mt = NOTIFICATION, android_sub_oid = POLLING_FRAME) {

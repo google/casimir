@@ -146,7 +146,7 @@ RF management
 | RF_DEACTIVATE_RSP               |              |                                                 |
 | RF_DEACTIVATE_NTF               |              |                                                 |
 +---------------------------------+--------------+-------------------------------------------------+
-| RF_FIELD_INFO_NTF               | Not started  |                                                 |
+| RF_FIELD_INFO_NTF               | Completed    |                                                 |
 +---------------------------------+--------------+-------------------------------------------------+
 | RF_T3T_POLLING_CMD              | Not started  |                                                 |
 | RF_T3T_POLLING_RSP              |              |                                                 |
