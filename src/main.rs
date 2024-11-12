@@ -22,9 +22,8 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::pin::{pin, Pin};
 use std::task::Context;
 use std::task::Poll;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
-use tokio::net::{tcp, TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::select;
 use tokio::sync::mpsc;
 
@@ -40,19 +39,19 @@ type Id = u16;
 /// Read RF Control and Data packets received on the RF transport.
 /// Performs recombination of the segmented packets.
 pub struct RfReader {
-    socket: tcp::OwnedReadHalf,
+    socket: Pin<Box<dyn AsyncRead>>,
 }
 
 /// Write RF Control and Data packets received to the RF transport.
 /// Performs segmentation of the packets.
 pub struct RfWriter {
-    socket: tcp::OwnedWriteHalf,
+    socket: Pin<Box<dyn AsyncWrite>>,
 }
 
 impl RfReader {
-    /// Create a new RF reader from the TCP socket half.
-    pub fn new(socket: tcp::OwnedReadHalf) -> Self {
-        RfReader { socket }
+    /// Create a new RF reader from an `AsyncRead` implementation.
+    pub fn new(socket: impl AsyncRead + 'static) -> Self {
+        RfReader { socket: Box::pin(socket) }
     }
 
     /// Read a single RF packet from the reader.
@@ -74,9 +73,9 @@ impl RfReader {
 }
 
 impl RfWriter {
-    /// Create a new RF writer from the TCP socket half.
-    pub fn new(socket: tcp::OwnedWriteHalf) -> Self {
-        RfWriter { socket }
+    /// Create a new RF writer from an `AsyncWrite` implementation.
+    pub fn new(socket: impl AsyncWrite + 'static) -> Self {
+        RfWriter { socket: Box::pin(socket) }
     }
 
     /// Write a single RF packet to the writer.
@@ -112,7 +111,8 @@ pub struct Device {
 impl Device {
     fn nci(
         id: Id,
-        socket: TcpStream,
+        nci_rx: impl AsyncRead + 'static,
+        nci_tx: impl AsyncWrite + 'static,
         controller_rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
     ) -> Device {
         let (rf_tx, rf_rx) = mpsc::unbounded_channel();
@@ -120,7 +120,6 @@ impl Device {
             id,
             rf_tx,
             task: Box::pin(async move {
-                let (nci_rx, nci_tx) = socket.into_split();
                 Controller::run(
                     id,
                     pin!(nci::Reader::new(nci_rx).into_stream()),
@@ -135,7 +134,8 @@ impl Device {
 
     fn rf(
         id: Id,
-        socket: TcpStream,
+        socket_rx: impl AsyncRead + 'static,
+        socket_tx: impl AsyncWrite + 'static,
         controller_rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
     ) -> Device {
         let (rf_tx, mut rf_rx) = mpsc::unbounded_channel();
@@ -143,7 +143,6 @@ impl Device {
             id,
             rf_tx,
             task: Box::pin(async move {
-                let (socket_rx, socket_tx) = socket.into_split();
                 let mut rf_reader = RfReader::new(socket_rx);
                 let mut rf_writer = RfWriter::new(socket_tx);
 
@@ -314,7 +313,8 @@ async fn run() -> Result<()> {
             result = nci_listener.accept() => {
                 let (socket, addr) = result?;
                 info!("Incoming NCI connection from {}", addr);
-                match scene.add_device(|id| Device::nci(id, socket, rf_tx.clone())) {
+                let (socket_rx, socket_tx) = socket.into_split();
+                match scene.add_device(|id| Device::nci(id, socket_rx, socket_tx, rf_tx.clone())) {
                     Ok(id) => info!("Accepted NCI connection from {} in slot {}", addr, id),
                     Err(err) => error!("Failed to accept NCI connection from {}: {}", addr, err)
                 }
@@ -322,7 +322,8 @@ async fn run() -> Result<()> {
             result = rf_listener.accept() => {
                 let (socket, addr) = result?;
                 info!("Incoming RF connection from {}", addr);
-                match scene.add_device(|id| Device::rf(id, socket, rf_tx.clone())) {
+                let (socket_rx, socket_tx) = socket.into_split();
+                match scene.add_device(|id| Device::rf(id, socket_rx, socket_tx, rf_tx.clone())) {
                     Ok(id) => info!("Accepted RF connection from {} in slot {}", addr, id),
                     Err(err) => error!("Failed to accept RF connection from {}: {}", addr, err)
                 }
