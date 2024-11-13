@@ -23,7 +23,7 @@ use std::pin::{pin, Pin};
 use std::task::Context;
 use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UnixListener};
 use tokio::select;
 use tokio::sync::mpsc;
 
@@ -297,6 +297,8 @@ struct Opt {
 /// Abstraction between different server sources
 enum Listener {
     Tcp(TcpListener),
+    #[allow(unused)]
+    Unix(UnixListener),
 }
 
 impl Listener {
@@ -308,6 +310,11 @@ impl Listener {
                 let (socket, addr) = tcp.accept().await?;
                 let (rx, tx) = socket.into_split();
                 Ok((Box::pin(rx), Box::pin(tx), format!("{}", addr)))
+            }
+            Listener::Unix(unix) => {
+                let (socket, addr) = unix.accept().await?;
+                let (rx, tx) = socket.into_split();
+                Ok((Box::pin(rx), Box::pin(tx), format!("{:?}", addr)))
             }
         }
     }
