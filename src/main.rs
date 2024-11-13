@@ -294,35 +294,54 @@ struct Opt {
     rf_port: u16,
 }
 
+/// Abstraction between different server sources
+enum Listener {
+    Tcp(TcpListener),
+}
+
+impl Listener {
+    async fn accept_split(
+        &self,
+    ) -> Result<(Pin<Box<dyn AsyncRead>>, Pin<Box<dyn AsyncWrite>>, String)> {
+        match self {
+            Listener::Tcp(tcp) => {
+                let (socket, addr) = tcp.accept().await?;
+                let (rx, tx) = socket.into_split();
+                Ok((Box::pin(rx), Box::pin(tx), format!("{}", addr)))
+            }
+        }
+    }
+}
+
 async fn run() -> Result<()> {
     env_logger::init_from_env(
         env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "debug"),
     );
 
     let opt: Opt = argh::from_env();
-    let nci_listener =
-        TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, opt.nci_port)).await?;
-    let rf_listener =
-        TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, opt.rf_port)).await?;
+    let nci_listener = Listener::Tcp(
+        TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, opt.nci_port)).await?,
+    );
+    let rf_listener = Listener::Tcp(
+        TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, opt.rf_port)).await?,
+    );
     let (rf_tx, mut rf_rx) = mpsc::unbounded_channel();
     let mut scene = Scene::new();
     info!("Listening for NCI connections at address 127.0.0.1:{}", opt.nci_port);
     info!("Listening for RF connections at address 127.0.0.1:{}", opt.rf_port);
     loop {
         select! {
-            result = nci_listener.accept() => {
-                let (socket, addr) = result?;
+            result = nci_listener.accept_split() => {
+                let (socket_rx, socket_tx, addr) = result?;
                 info!("Incoming NCI connection from {}", addr);
-                let (socket_rx, socket_tx) = socket.into_split();
                 match scene.add_device(|id| Device::nci(id, socket_rx, socket_tx, rf_tx.clone())) {
                     Ok(id) => info!("Accepted NCI connection from {} in slot {}", addr, id),
                     Err(err) => error!("Failed to accept NCI connection from {}: {}", addr, err)
                 }
             },
-            result = rf_listener.accept() => {
-                let (socket, addr) = result?;
+            result = rf_listener.accept_split() => {
+                let (socket_rx, socket_tx, addr) = result?;
                 info!("Incoming RF connection from {}", addr);
-                let (socket_rx, socket_tx) = socket.into_split();
                 match scene.add_device(|id| Device::rf(id, socket_rx, socket_tx, rf_tx.clone())) {
                     Ok(id) => info!("Accepted RF connection from {} in slot {}", addr, id),
                     Err(err) => error!("Failed to accept RF connection from {}: {}", addr, err)
