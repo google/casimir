@@ -895,9 +895,19 @@ enum PollingFrameType : 8 {
   WUPV = 0x9,
 }
 
+enum PollingFrameFormat: 1 {
+  SHORT = 0x00,
+  LONG = 0x01,
+}
+
+struct PollingFrameFlags {
+  _reserved_: 7,
+  format: PollingFrameFormat,
+}
+
 struct PollingFrame {
   frame_type: PollingFrameType,
-  flags: 8,
+  flags: PollingFrameFlags,
   _size_(_payload_): 8,
   // The timestamp is encoded in big-endian byte order,
   // whereas other NCI definitions are little-endian.

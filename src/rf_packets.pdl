@@ -19,6 +19,19 @@ enum Technology : 8 {
     RAW = 0x7,
 }
 
+/// Packet transmission bit-rate in bits/s.
+/// Values are quoted from [NCI] Table 132: Bit Rates
+enum BitRate : 8 {
+    BIT_RATE_106_KBIT_S = 0x00,
+    BIT_RATE_212_KBIT_S = 0x01,
+    BIT_RATE_424_KBIT_S = 0x02,
+    BIT_RATE_848_KBIT_S = 0x03,
+    BIT_RATE_1695_KBIT_S = 0x04,
+    BIT_RATE_3390_KBIT_S = 0x05,
+    BIT_RATE_6780_KBIT_S = 0x06,
+    BIT_RATE_26_KBIT_S = 0x20,
+}
+
 /// Protocol used for data exchange.
 /// The values are taken from [NCI] Table 133: RF Protocol.
 /// The following table presents the compatible protocols
@@ -72,10 +85,20 @@ packet RfPacket {
     technology: Technology,
     protocol : Protocol,
     packet_type: RfPacketType,
+    // Bitrate (speed) that the data is sent at.
+    bitrate: BitRate,
     // Power level from 0-12 with higher numbers representing stronger field strength.
     // OxFF represents an unknown or invalid value.
     power_level: 8,
     _payload_,
+}
+
+// Polling frame format
+// SHORT frames have 7 bits in the last byte (WUPA/REQA)
+// LONG frames have 8 bits in the last byte
+enum PollingFrameFormat: 1 {
+  SHORT = 0x00,
+  LONG = 0x01,
 }
 
 /// Command to probe for Listeners:
@@ -85,6 +108,8 @@ packet RfPacket {
 /// - INVENTORY_REQ Command for NFC-V
 /// - ATR_REQ Command for NFC-ACM
 packet PollCommand : RfPacket (packet_type = POLL_COMMAND) {
+    format: PollingFrameFormat,
+    _reserved_: 7,
     _payload_,
 }
 

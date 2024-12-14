@@ -30,6 +30,7 @@ use tokio::select;
 use tokio::sync::mpsc;
 
 pub mod controller;
+pub mod crc;
 pub mod packets;
 
 use controller::Controller;
@@ -237,6 +238,7 @@ impl Scene {
                         reason: rf::DeactivateReason::RfLinkLoss,
                         sender: id,
                         receiver: device.id,
+                        bitrate: rf::BitRate::BitRate106KbitS,
                         power_level: 255,
                         technology: rf::Technology::NfcA,
                         protocol: rf::Protocol::Undetermined,
