@@ -65,7 +65,7 @@ To run a basic tag detection test on Cuttlefish:
     launch_cvd
 
     # Create a tag device connected to the casimir instance.
-    cd $ANDROID_TOP/system/nfc/tools/casimir
+    cd $ANDROID_TOP/packages/modules/Nfc/libnfc-nci/tools/casimir
     ./scripts/t4at.py --rf-port 8100 --mode listen
 
 
