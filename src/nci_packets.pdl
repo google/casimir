@@ -77,6 +77,7 @@ enum AndroidSubOpcodeId : 8 {
   PASSIVE_OBSERVE_MODE = 0x2,
   POLLING_FRAME = 0x3,
   QUERY_PASSIVE_OBSERVE_MODE = 0x4,
+  SET_PASSIVE_OBSERVER_TECH = 0x5
 }
 
 enum Status : 8 {
@@ -880,6 +881,14 @@ packet AndroidQueryPassiveObserveModeCommand : AndroidPacket(mt = COMMAND, andro
 packet AndroidQueryPassiveObserveModeResponse : AndroidPacket(mt = RESPONSE, android_sub_oid = QUERY_PASSIVE_OBSERVE_MODE) {
   status: Status,
   passive_observe_mode: PassiveObserveMode,
+}
+
+packet AndroidSetPassiveObserverTechCommand : AndroidPacket(mt = COMMAND, android_sub_oid = SET_PASSIVE_OBSERVER_TECH) {
+  tech_mask: 8
+}
+
+packet AndroidSetPassiveObserverTechResponse : AndroidPacket(mt = RESPONSE, android_sub_oid = SET_PASSIVE_OBSERVER_TECH) {
+  status: Status,
 }
 
 enum PollingFrameType : 8 {

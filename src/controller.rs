@@ -1337,7 +1337,7 @@ impl<'a> Controller<'a> {
     async fn android_get_caps(&mut self, _cmd: nci::AndroidGetCapsCommand) -> Result<()> {
         info!("[{}] ANDROID_GET_CAPS_CMD", self.id);
         let cap_tlvs = vec![
-            nci::CapTlv { t: nci::CapTlvType::PassiveObserverMode, v: vec![1] },
+            nci::CapTlv { t: nci::CapTlvType::PassiveObserverMode, v: vec![2] },
             nci::CapTlv { t: nci::CapTlvType::PollingFrameNotification, v: vec![1] },
         ];
         self.send_control(nci::AndroidGetCapsResponseBuilder {
@@ -1357,6 +1357,28 @@ impl<'a> Controller<'a> {
         info!("     Mode: {:?}", cmd.get_passive_observe_mode());
 
         self.state.passive_observe_mode = cmd.get_passive_observe_mode();
+        self.send_control(nci::AndroidPassiveObserveModeResponseBuilder {
+            status: nci::Status::Ok,
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn android_set_passive_observer_tech(
+        &mut self,
+        cmd: nci::AndroidSetPassiveObserverTechCommand,
+    ) -> Result<()> {
+        info!("[{}] ANDROID_SET_PASSIVE_OBSERVER_TECH_CMD", self.id);
+        info!("     Mask: {:?}", cmd.get_tech_mask());
+
+        // TODO add observe mode state for other techs
+        // 0x01: NFC-A
+        if cmd.get_tech_mask() & 0x01 == 0x01 {
+            self.state.passive_observe_mode = nci::PassiveObserveMode::Enable;
+        } else {
+            self.state.passive_observe_mode = nci::PassiveObserveMode::Disable;
+        }
+
         self.send_control(nci::AndroidPassiveObserveModeResponseBuilder {
             status: nci::Status::Ok,
         })
@@ -1416,6 +1438,9 @@ impl<'a> Controller<'a> {
                     AndroidGetCapsCommand(cmd) => self.android_get_caps(cmd).await,
                     AndroidPassiveObserveModeCommand(cmd) => {
                         self.android_passive_observe_mode(cmd).await
+                    }
+                    AndroidSetPassiveObserverTechCommand(cmd) => {
+                        self.android_set_passive_observer_tech(cmd).await
                     }
                     AndroidQueryPassiveObserveModeCommand(cmd) => {
                         self.android_query_passive_observe_mode(cmd).await
