@@ -1578,9 +1578,29 @@ impl<'a> Controller<'a> {
         .await
     }
 
-    async fn dynamic_conn_data(&self, _conn_id: u8, _packet: nci::DataPacket) -> Result<()> {
+    async fn dynamic_conn_data(&mut self, conn_id: u8, packet: nci::DataPacket) -> Result<()> {
         info!("[{}] received data on dynamic logical connection", self.id);
-        todo!()
+        let response = packet.get_payload();
+
+        self.send_data(nci::DataPacketBuilder {
+            mt: nci::MessageType::Data,
+            conn_id: nci::ConnId::from_dynamic(conn_id),
+            cr: 0,
+            payload: Some(bytes::Bytes::copy_from_slice(response)),
+        })
+        .await?;
+
+        // Resplenish the credit count for the HCI Connection.
+        self.send_control(
+            nci::CoreConnCreditsNotificationBuilder {
+                connections: vec![nci::ConnectionCredits {
+                    conn_id: nci::ConnId::from_dynamic(conn_id),
+                    credits: 1,
+                }],
+            }
+            .build(),
+        )
+        .await
     }
 
     async fn receive_data(&mut self, packet: nci::DataPacket) -> Result<()> {
