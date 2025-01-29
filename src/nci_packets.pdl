@@ -863,8 +863,17 @@ packet AndroidGetCapsResponse : AndroidPacket (mt = RESPONSE, android_sub_oid = 
 }
 
 enum PassiveObserveMode : 8 {
-  DISABLE = 0x0,
-  ENABLE = 0x1,
+  DISABLE = 0x00,
+  ENABLE = ..,
+}
+
+enum TechnologyMask : 8 {
+  ALL_OFF = 0x00,
+  NFC_A = 0x01,
+  NFC_B = 0x02,
+  NFC_F = 0x04,
+  NFC_V = 0x08,
+  ALL_ON = 0x0F,
 }
 
 packet AndroidPassiveObserveModeCommand : AndroidPacket(mt = COMMAND, android_sub_oid = PASSIVE_OBSERVE_MODE) {
@@ -880,7 +889,7 @@ packet AndroidQueryPassiveObserveModeCommand : AndroidPacket(mt = COMMAND, andro
 
 packet AndroidQueryPassiveObserveModeResponse : AndroidPacket(mt = RESPONSE, android_sub_oid = QUERY_PASSIVE_OBSERVE_MODE) {
   status: Status,
-  passive_observe_mode: PassiveObserveMode,
+  passive_observe_mode: 8,
 }
 
 packet AndroidSetPassiveObserverTechCommand : AndroidPacket(mt = COMMAND, android_sub_oid = SET_PASSIVE_OBSERVER_TECH) {
