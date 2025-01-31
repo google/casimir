@@ -19,7 +19,7 @@ use crate::packets::{nci, rf};
 use anyhow::Result;
 use core::time::Duration;
 use futures::StreamExt;
-use log::{debug, error, info, trace, warn};
+use log::{debug, info, trace, warn};
 use pdl_runtime::Packet;
 use std::convert::TryFrom;
 use std::future::Future;
@@ -1557,50 +1557,9 @@ impl<'a> Controller<'a> {
         }
     }
 
-    async fn hci_conn_data(&mut self, packet: nci::DataPacket) -> Result<()> {
+    async fn hci_conn_data(&mut self, _packet: nci::DataPacket) -> Result<()> {
         info!("[{}] received data on HCI logical connection", self.id);
-
-        // TODO: parse and understand HCI Control Protocol (HCP)
-        // to accurately respond to the requests. For now it is sufficient
-        // to return hardcoded answers to identified requests.
-        let response = match packet.get_payload() {
-            // ANY_OPEN_PIPE()
-            [0x81, 0x03] => vec![0x81, 0x80],
-            // ANY_GET_PARAMETER(index=1)
-            [0x81, 0x02, 0x01] => vec![0x81, 0x80, 0xd7, 0xfe, 0x65, 0x66, 0xc7, 0xfe, 0x65, 0x66],
-            // ANY_GET_PARAMETER(index=4)
-            [0x81, 0x02, 0x04] => vec![0x81, 0x80, 0x00, 0xc0, 0x01],
-            // ANY_SET_PARAMETER()
-            [0x81, 0x01, 0x03, 0x02, 0xc0]
-            | [0x81, 0x01, 0x03, _, _, _]
-            | [0x81, 0x01, 0x01, _, 0x00, 0x00, 0x00, _, 0x00, 0x00, 0x00] => vec![0x81, 0x80],
-            // ADM_CLEAR_ALL_PIPE()
-            [0x81, 0x14, 0x02, 0x01] => vec![0x81, 0x80],
-            _ => {
-                error!("unimplemented HCI command : {:?}", packet.get_payload());
-                unimplemented!()
-            }
-        };
-
-        self.send_data(nci::DataPacketBuilder {
-            mt: nci::MessageType::Data,
-            conn_id: nci::ConnId::StaticHci,
-            cr: 0,
-            payload: Some(bytes::Bytes::copy_from_slice(&response)),
-        })
-        .await?;
-
-        // Resplenish the credit count for the HCI Connection.
-        self.send_control(
-            nci::CoreConnCreditsNotificationBuilder {
-                connections: vec![nci::ConnectionCredits {
-                    conn_id: nci::ConnId::StaticHci,
-                    credits: 1,
-                }],
-            }
-            .build(),
-        )
-        .await
+        Ok(())
     }
 
     async fn dynamic_conn_data(&mut self, conn_id: u8, packet: nci::DataPacket) -> Result<()> {
