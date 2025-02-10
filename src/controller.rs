@@ -61,6 +61,9 @@ const MAX_CONTROL_PACKET_PAYLOAD_SIZE: u8 = 255;
 const MAX_DATA_PACKET_PAYLOAD_SIZE: u8 = 255;
 const NUMBER_OF_CREDITS: u8 = 1;
 const MAX_NFCV_RF_FRAME_SIZE: u16 = 512;
+const NUMBER_OF_SUPPORTED_EXIT_FRAMES: u8 = 5;
+const EXIT_FRAME_QUALIFIER_TECHNOLOGY_MASK: u8 = 0b00000011;
+const EXIT_FRAME_QUALIFIER_PREFIX_MATCHING_MASK: u8 = 0b00010000;
 
 /// Time in milliseconds that Casimir waits for poll responses after
 /// sending a poll command.
@@ -214,6 +217,16 @@ pub struct RfPollResponse {
     rf_technology_specific_parameters: Vec<u8>,
 }
 
+/// Exit frame data received by the Set exit frame command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RfExitFrame {
+    is_prefix_matching_allowed: bool,
+    rf_technology: rf::Technology,
+    power_states: u8,
+    data: Vec<u8>,
+    mask: Vec<u8>,
+}
+
 /// State of an NFCC instance.
 #[allow(missing_docs)]
 pub struct State {
@@ -225,9 +238,14 @@ pub struct State {
     pub rf_state: RfState,
     pub rf_poll_responses: Vec<RfPollResponse>,
     pub rf_activation_parameters: Vec<u8>,
+    // TODO(johnrjohn) Use bitflags here
     pub passive_observe_mode: u8,
+    pub last_observe_mode_state: Option<u8>,
     pub start_time: std::time::Instant,
     pub remote_field_status: rf::FieldStatus,
+    pub exit_frame_timeout: Duration,
+    pub exit_frame_start_time: Option<std::time::Instant>,
+    pub exit_frames: Vec<RfExitFrame>,
 }
 
 /// State of an NFCC instance.
@@ -732,8 +750,12 @@ impl<'a> Controller<'a> {
                 rf_poll_responses: vec![],
                 rf_activation_parameters: vec![],
                 passive_observe_mode: nci::PassiveObserveMode::Disable.into(),
+                last_observe_mode_state: None,
                 start_time: Instant::now(),
                 remote_field_status: rf::FieldStatus::FieldOff,
+                exit_frame_timeout: Duration::from_millis(0),
+                exit_frame_start_time: None,
+                exit_frames: vec![],
             },
         }
     }
@@ -1339,6 +1361,11 @@ impl<'a> Controller<'a> {
         let cap_tlvs = vec![
             nci::CapTlv { t: nci::CapTlvType::PassiveObserverMode, v: vec![2] },
             nci::CapTlv { t: nci::CapTlvType::PollingFrameNotification, v: vec![1] },
+            nci::CapTlv { t: nci::CapTlvType::AutotransactPollingLoopFilter, v: vec![1] },
+            nci::CapTlv {
+                t: nci::CapTlvType::NumberOfExitFramesSupported,
+                v: vec![NUMBER_OF_SUPPORTED_EXIT_FRAMES],
+            },
         ];
         self.send_control(nci::AndroidGetCapsResponseBuilder {
             status: nci::Status::Ok,
@@ -1362,6 +1389,8 @@ impl<'a> Controller<'a> {
             } else {
                 u8::from(nci::TechnologyMask::AllOn)
             };
+        self.state.last_observe_mode_state = None;
+        self.state.exit_frame_start_time = None;
         self.send_control(nci::AndroidPassiveObserveModeResponseBuilder {
             status: nci::Status::Ok,
         })
@@ -1377,6 +1406,8 @@ impl<'a> Controller<'a> {
         info!("     Mask: {:#b}", cmd.get_tech_mask());
 
         self.state.passive_observe_mode = cmd.get_tech_mask();
+        self.state.last_observe_mode_state = None;
+        self.state.exit_frame_start_time = None;
 
         self.send_control(nci::AndroidPassiveObserveModeResponseBuilder {
             status: nci::Status::Ok,
@@ -1395,6 +1426,54 @@ impl<'a> Controller<'a> {
         self.send_control(nci::AndroidQueryPassiveObserveModeResponseBuilder {
             status: nci::Status::Ok,
             passive_observe_mode: self.state.passive_observe_mode,
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn android_set_passive_observer_exit_frames(
+        &mut self,
+        cmd: nci::AndroidSetPassiveObserverExitFrameCommand,
+    ) -> Result<()> {
+        info!("[{}] ANDROID_SET_PASSIVE_OBSERVER_EXIT_FRAMES_CMD", self.id);
+
+        if self.state.rf_state == RfState::Idle || self.state.rf_state == RfState::Discovery {
+            self.state.exit_frames.clear();
+            self.state.exit_frame_timeout =
+                Duration::from_millis(u16::from_le(cmd.get_timeout()) as u64);
+            let exit_frame_count = cmd.get_exit_frames().len();
+            info!("number of exit frames {:?}", exit_frame_count);
+            let incoming_frames = cmd.get_exit_frames();
+            for frame in incoming_frames.iter() {
+                let data_length = frame.field_value[1..].len() / 2;
+                let power_states = frame.field_value[0];
+                let mut data: Vec<u8> = vec![];
+                data.clone_from(&frame.field_value[1..1 + data_length].to_vec());
+                let mut mask: Vec<u8> = vec![];
+                mask.clone_from(&frame.field_value[1 + data_length..].to_vec());
+
+                self.state.exit_frames.push(RfExitFrame {
+                    power_states,
+                    data,
+                    mask,
+                    rf_technology: rf::Technology::from_u8(
+                        frame.qualifier_type & EXIT_FRAME_QUALIFIER_TECHNOLOGY_MASK,
+                    ),
+                    is_prefix_matching_allowed: frame.qualifier_type
+                        & EXIT_FRAME_QUALIFIER_PREFIX_MATCHING_MASK
+                        != 0,
+                });
+                info!("Added exit frame {:?}", self.state.exit_frames.last().unwrap())
+            }
+
+            self.send_control(nci::AndroidSetPassiveObserverExitFrameResponseBuilder {
+                status: nci::Status::Ok,
+            })
+            .await?;
+            return Ok(());
+        }
+        self.send_control(nci::AndroidSetPassiveObserverExitFrameResponseBuilder {
+            status: nci::Status::SemanticError,
         })
         .await?;
         Ok(())
@@ -1444,6 +1523,9 @@ impl<'a> Controller<'a> {
                     }
                     AndroidQueryPassiveObserveModeCommand(cmd) => {
                         self.android_query_passive_observe_mode(cmd).await
+                    }
+                    AndroidSetPassiveObserverExitFrameCommand(cmd) => {
+                        self.android_set_passive_observer_exit_frames(cmd).await
                     }
                     _ => {
                         unimplemented!("unsupported android oid {:?}", packet.get_android_sub_oid())
@@ -1658,6 +1740,13 @@ impl<'a> Controller<'a> {
             _ => (false, data.to_vec()),
         };
 
+        if self.has_exit_frame(&data, technology) {
+            self.state.last_observe_mode_state = Some(self.state.passive_observe_mode);
+            self.state.passive_observe_mode = nci::PassiveObserveMode::Disable.into();
+            self.state.exit_frame_start_time = Some(Instant::now());
+            // TODO(johnrjohn) send NCI_ANDROID_PASSIVE_OBSERVER_SUSPENDED_NTF
+        }
+
         self.send_control(nci::AndroidPollingLoopNotificationBuilder {
             polling_frames: vec![nci::PollingFrame {
                 frame_type: match technology {
@@ -1760,6 +1849,38 @@ impl<'a> Controller<'a> {
         }
 
         Ok(())
+    }
+
+    fn has_exit_frame(&mut self, polling_frame_data: &[u8], rf_technology: rf::Technology) -> bool {
+        'frame_loop: for exit_frame in self.state.exit_frames.iter() {
+            if rf_technology != exit_frame.rf_technology {
+                continue;
+            }
+
+            let exit_frame_len = exit_frame.data.len();
+            // This checks if the data in the exit frame matches the polling frame.
+            for n in 0..exit_frame_len {
+                if n >= polling_frame_data.len()
+                    || exit_frame.data[n] != (polling_frame_data[n] & exit_frame.mask[n])
+                {
+                    continue 'frame_loop;
+                }
+            }
+            // TODO(johnrjohn) Check if power state matches.
+
+            // If the lengths do not match, or if prefix matching is not allowed, it means there
+            // is unmatched data in the polling frame and this isn't a match.
+            if exit_frame.data.len() == polling_frame_data.len()
+                || exit_frame.is_prefix_matching_allowed
+            {
+                info!(
+                    "Exit frame matched! PollingFrame: {:?}, ExitFrame {:?}",
+                    polling_frame_data, exit_frame
+                );
+                return true;
+            }
+        }
+        false
     }
 
     async fn nfca_poll_response(&mut self, cmd: rf::NfcAPollResponse) -> Result<()> {
@@ -2156,6 +2277,17 @@ impl<'a> Controller<'a> {
     async fn tick(&mut self) -> Result<()> {
         if self.state.rf_state != RfState::Discovery {
             return Ok(());
+        }
+
+        if self.state.exit_frame_start_time.is_some() {
+            let elapsed_ms = self.state.exit_frame_start_time.unwrap().elapsed().as_millis();
+            if elapsed_ms > self.state.exit_frame_timeout.as_millis() {
+                self.state.exit_frame_start_time = None;
+                self.state.passive_observe_mode =
+                    self.state.last_observe_mode_state.unwrap_or(nci::TechnologyMask::AllOn.into());
+                info!("Turning observe mode back on, exit frame timeout has passed.");
+                // TODO(johnrjohn) send NCI_ANDROID_PASSIVE_OBSERVER_RESUMED_NTF
+            }
         }
 
         //info!("[{}] poll", self.id);

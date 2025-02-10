@@ -225,6 +225,19 @@ impl TryFrom<nci::RfTechnologyAndMode> for rf::Technology {
     }
 }
 
+impl rf::Technology {
+    /// Creates an rf::Technology from a byte.
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            0 => rf::Technology::NfcA,
+            1 => rf::Technology::NfcB,
+            2 => rf::Technology::NfcF,
+            3 => rf::Technology::NfcV,
+            _ => rf::Technology::Raw,
+        }
+    }
+}
+
 impl From<rf::DeactivateType> for nci::DeactivationType {
     fn from(type_: rf::DeactivateType) -> Self {
         match type_ {

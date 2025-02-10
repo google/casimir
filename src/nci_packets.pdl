@@ -77,7 +77,10 @@ enum AndroidSubOpcodeId : 8 {
   PASSIVE_OBSERVE_MODE = 0x2,
   POLLING_FRAME = 0x3,
   QUERY_PASSIVE_OBSERVE_MODE = 0x4,
-  SET_PASSIVE_OBSERVER_TECH = 0x5
+  SET_PASSIVE_OBSERVER_TECH = 0x5,
+  SET_PASSIVE_OBSERVER_EXIT_FRAME = 0x06,
+  GET_PASSIVE_OBSERVER_EXIT_FRAME = 0x07,
+  BLANK_NCI = 0x8,
 }
 
 enum Status : 8 {
@@ -847,6 +850,8 @@ enum CapTlvType: 8 {
   PASSIVE_OBSERVER_MODE = 0x00,
   POLLING_FRAME_NOTIFICATION = 0x01,
   POWER_SAVING_MODE = 0x02,
+  AUTOTRANSACT_POLLING_LOOP_FILTER = 0x03,
+  NUMBER_OF_EXIT_FRAMES_SUPPORTED = 0x04,
 }
 
 struct CapTlv {
@@ -936,4 +941,21 @@ struct PollingFrame {
 
 packet AndroidPollingLoopNotification : AndroidPacket(mt = NOTIFICATION, android_sub_oid = POLLING_FRAME) {
   polling_frames: PollingFrame[],
+}
+
+struct ExitFrameEntry {
+  qualifier_type: 8,
+  _size_(field_value): 8,
+  // Value contains power states, data, and data mask
+  field_value: 8[]
+}
+
+packet AndroidSetPassiveObserverExitFrameCommand : AndroidPacket(mt = COMMAND, android_sub_oid = SET_PASSIVE_OBSERVER_EXIT_FRAME) {
+  timeout: 16,
+  _count_(exit_frames): 8,
+  exit_frames: ExitFrameEntry[]
+}
+
+packet AndroidSetPassiveObserverExitFrameResponse : AndroidPacket(mt = RESPONSE, android_sub_oid = SET_PASSIVE_OBSERVER_EXIT_FRAME) {
+  status: Status,
 }
