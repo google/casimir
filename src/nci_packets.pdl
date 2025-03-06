@@ -84,7 +84,9 @@ enum AndroidSubOpcodeId : 8 {
   BLANK_NCI = 0x8,
   SET_TECH_A_POLLING_LOOP_ANNOTATION = 0x09,
   QUERY_POWER_SAVING_MODE = 0x0A,
-}
+  ANDROID_PASSIVE_OBSERVER_SUSPENDED = 0xB,
+  ANDROID_PASSIVE_OBSERVER_RESUMED = 0xC,
+ }
 
 enum Status : 8 {
   OK = 0x00,
@@ -963,3 +965,11 @@ packet AndroidSetPassiveObserverExitFrameCommand : AndroidPacket(mt = COMMAND, a
 packet AndroidSetPassiveObserverExitFrameResponse : AndroidPacket(mt = RESPONSE, android_sub_oid = SET_PASSIVE_OBSERVER_EXIT_FRAME) {
   status: Status,
 }
+
+packet PassiveObserverSuspendedNotification : AndroidPacket(mt = NOTIFICATION, android_sub_oid = ANDROID_PASSIVE_OBSERVER_SUSPENDED) {
+  exit_frame_type: 8,
+  _size_(_payload_): 8,
+  _payload_
+}
+
+packet PassiveObserverResumedNotification : AndroidPacket(mt = NOTIFICATION, android_sub_oid = ANDROID_PASSIVE_OBSERVER_RESUMED) {}

@@ -1744,7 +1744,16 @@ impl<'a> Controller<'a> {
             self.state.last_observe_mode_state = Some(self.state.passive_observe_mode);
             self.state.passive_observe_mode = nci::PassiveObserveMode::Disable.into();
             self.state.exit_frame_start_time = Some(Instant::now());
-            // TODO(johnrjohn) send NCI_ANDROID_PASSIVE_OBSERVER_SUSPENDED_NTF
+
+            self.send_control(nci::PassiveObserverSuspendedNotificationBuilder {
+                exit_frame_type: match technology {
+                    rf::Technology::NfcA => 0x00,
+                    rf::Technology::NfcB => 0x01,
+                    _ => panic!(),
+                },
+                payload: Some(data.clone().into()),
+            })
+            .await?;
         }
 
         self.send_control(nci::AndroidPollingLoopNotificationBuilder {
@@ -2286,7 +2295,7 @@ impl<'a> Controller<'a> {
                 self.state.passive_observe_mode =
                     self.state.last_observe_mode_state.unwrap_or(nci::TechnologyMask::AllOn.into());
                 info!("Turning observe mode back on, exit frame timeout has passed.");
-                // TODO(johnrjohn) send NCI_ANDROID_PASSIVE_OBSERVER_RESUMED_NTF
+                self.send_control(nci::PassiveObserverResumedNotificationBuilder {}).await?;
             }
         }
 
