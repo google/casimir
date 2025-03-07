@@ -74,6 +74,7 @@ enum ProprietaryOpcodeId : 6 {
 
 enum AndroidSubOpcodeId : 8 {
   GET_CAPS = 0x0,
+  POWER_SAVING_MODE = 0x1,
   PASSIVE_OBSERVE_MODE = 0x2,
   POLLING_FRAME = 0x3,
   QUERY_PASSIVE_OBSERVE_MODE = 0x4,
@@ -81,6 +82,8 @@ enum AndroidSubOpcodeId : 8 {
   SET_PASSIVE_OBSERVER_EXIT_FRAME = 0x06,
   GET_PASSIVE_OBSERVER_EXIT_FRAME = 0x07,
   BLANK_NCI = 0x8,
+  SET_TECH_A_POLLING_LOOP_ANNOTATION = 0x09,
+  QUERY_POWER_SAVING_MODE = 0x0A,
 }
 
 enum Status : 8 {
