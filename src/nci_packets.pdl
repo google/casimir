@@ -954,6 +954,7 @@ struct ExitFrameEntry {
 }
 
 packet AndroidSetPassiveObserverExitFrameCommand : AndroidPacket(mt = COMMAND, android_sub_oid = SET_PASSIVE_OBSERVER_EXIT_FRAME) {
+  more: 8,
   timeout: 16,
   _count_(exit_frames): 8,
   exit_frames: ExitFrameEntry[]
