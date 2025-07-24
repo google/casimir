@@ -25,7 +25,7 @@ thiserror = "1.0.40"
 tokio = { version = "1.22", features = ["full", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 grpcio = "0.13"
-protobuf = "2.8.0"
+protobuf = "3.7.2"
 
 [build-dependencies]
 pdl-compiler = "0.3.0"
