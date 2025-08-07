@@ -910,7 +910,7 @@ impl<'a> Controller<'a> {
         let mut valid_parameters = vec![];
         let mut invalid_parameters = vec![];
         for id in cmd.get_parameters() {
-            info!("         ID: {:?}", id);
+            info!("         ID: {id:?}");
             match self.state.config_parameters.get(*id) {
                 Ok(value) => {
                     valid_parameters.push(nci::ConfigParameter { id: *id, value: value.to_vec() })
@@ -1442,7 +1442,7 @@ impl<'a> Controller<'a> {
             self.state.exit_frame_timeout =
                 Duration::from_millis(u16::from_le(cmd.get_timeout()) as u64);
             let exit_frame_count = cmd.get_exit_frames().len();
-            info!("number of exit frames {:?}", exit_frame_count);
+            info!("number of exit frames {exit_frame_count:?}");
             let incoming_frames = cmd.get_exit_frames();
             for frame in incoming_frames.iter() {
                 let data_length = frame.field_value[1..].len() / 2;
@@ -1883,8 +1883,7 @@ impl<'a> Controller<'a> {
                 || exit_frame.is_prefix_matching_allowed
             {
                 info!(
-                    "Exit frame matched! PollingFrame: {:?}, ExitFrame {:?}",
-                    polling_frame_data, exit_frame
+                    "Exit frame matched! PollingFrame: {polling_frame_data:?}, ExitFrame {exit_frame:?}"
                 );
                 return true;
             }
@@ -2040,8 +2039,8 @@ impl<'a> Controller<'a> {
 
         info!("[{}] RF_INTF_ACTIVATED_NTF", self.id);
         info!("         DiscoveryID: {:?}", nci::RfDiscoveryId::from_index(rf_discovery_id));
-        info!("         Interface: {:?}", rf_interface);
-        info!("         Protocol: {:?}", rf_protocol);
+        info!("         Interface: {rf_interface:?}");
+        info!("         Protocol: {rf_protocol:?}");
         info!("         ActivationTechnology: NFC_A_PASSIVE_POLL");
         info!("         RATS: {:?}", cmd.get_rats_response());
 

@@ -29,7 +29,6 @@ use tokio::select;
 use tokio::sync::mpsc;
 
 pub mod controller;
-pub mod crc;
 pub mod packets;
 mod proto;
 
@@ -189,7 +188,7 @@ impl Device {
                                 .recv()
                                 .await
                                 .ok_or(anyhow::anyhow!("rf_rx channel closed"))?;
-                            rf_writer.write(&packet.encode_to_vec()?).await?;
+                            rf_writer.write(&packet.to_vec()).await?;
                         }
                     },
                 )
@@ -254,8 +253,6 @@ impl Scene {
                         reason: rf::DeactivateReason::RfLinkLoss,
                         sender: id,
                         receiver: device.id,
-                        bitrate: rf::BitRate::BitRate106KbitS,
-                        power_level: 255,
                         technology: rf::Technology::NfcA,
                         protocol: rf::Protocol::Undetermined,
                     }
