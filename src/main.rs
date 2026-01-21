@@ -17,6 +17,7 @@
 use anyhow::Result;
 use argh::FromArgs;
 use log::{error, info, warn};
+use pdl_runtime::Packet;
 use rustutils::inherited_fd;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -160,7 +161,7 @@ impl Device {
                             packet_bytes[0..2].copy_from_slice(&id.to_le_bytes());
 
                             // Parse the input packet.
-                            let packet = rf::RfPacket::parse(&packet_bytes)?;
+                            let packet = rf::RfPacket::decode_full(&packet_bytes)?;
 
                             // Forward the packet to other devices.
                             controller_rf_tx.send(packet)?;
@@ -232,7 +233,7 @@ impl Scene {
             device
                 .rf_tx
                 .send(
-                    rf::DeactivateNotificationBuilder {
+                    rf::DeactivateNotification {
                         type_: rf::DeactivateType::Discovery,
                         reason: rf::DeactivateReason::RfLinkLoss,
                         sender: id,
@@ -242,7 +243,8 @@ impl Scene {
                         technology: rf::Technology::NfcA,
                         protocol: rf::Protocol::Undetermined,
                     }
-                    .into(),
+                    .try_into()
+                    .expect("failed to serialize notification"),
                 )
                 .expect("failed to send deactive notification")
         }
@@ -251,8 +253,8 @@ impl Scene {
     fn send(&self, packet: &rf::RfPacket) -> Result<()> {
         for n in 0..MAX_DEVICES {
             let Some(ref device) = self.devices[n] else { continue };
-            if packet.get_sender() != device.id
-                && (packet.get_receiver() == u16::MAX || packet.get_receiver() == device.id)
+            if packet.sender() != device.id
+                && (packet.receiver() == u16::MAX || packet.receiver() == device.id)
             {
                 device.rf_tx.send(packet.to_owned())?;
             }

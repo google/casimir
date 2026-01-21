@@ -104,16 +104,16 @@ pub mod nci {
             loop {
                 // Read the common packet header.
                 self.socket.read_exact(&mut complete_packet[0..HEADER_SIZE]).await?;
-                let header = PacketHeader::parse(&complete_packet[0..HEADER_SIZE])?;
+                let header = PacketHeader::decode_full(&complete_packet[0..HEADER_SIZE])?;
 
                 // Read the packet payload.
-                let payload_length = header.get_payload_length() as usize;
+                let payload_length = header.payload_length() as usize;
                 let mut payload_bytes = vec![0; payload_length];
                 self.socket.read_exact(&mut payload_bytes).await?;
                 complete_packet.extend(payload_bytes);
 
                 // Check the Packet Boundary Flag.
-                match header.get_pbf() {
+                match header.pbf() {
                     PacketBoundaryFlag::CompleteOrFinal => return Ok(complete_packet),
                     PacketBoundaryFlag::Incomplete => (),
                 }

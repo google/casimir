@@ -20,38 +20,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 fn main() {
-    install_generated_module(
-        "nci_packets.rs",
-        "NCI_PACKETS_PREBUILT",
-        &PathBuf::from("src/nci_packets.pdl").canonicalize().unwrap(),
-    );
-
-    install_generated_module(
-        "rf_packets.rs",
-        "RF_PACKETS_PREBUILT",
-        &PathBuf::from("src/rf_packets.pdl").canonicalize().unwrap(),
-    );
+    generate_module(&PathBuf::from("src/nci_packets.pdl").canonicalize().unwrap());
+    generate_module(&PathBuf::from("src/rf_packets.pdl").canonicalize().unwrap());
 
     protoc_grpcio::compile_grpc_protos(&["casimir.proto"], &["src/proto"], &"src/proto", None)
         .expect("gRPC generation failed");
-}
-
-fn install_generated_module(module_name: &str, prebuilt_var: &str, pdl_name: &Path) {
-    let module_prebuilt = match env::var(prebuilt_var) {
-        Ok(dir) => PathBuf::from(dir),
-        Err(_) => PathBuf::from(module_name),
-    };
-
-    if Path::new(module_prebuilt.as_os_str()).exists() {
-        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-        std::fs::copy(
-            module_prebuilt.as_os_str().to_str().unwrap(),
-            out_dir.join(module_name).as_os_str().to_str().unwrap(),
-        )
-        .unwrap();
-    } else {
-        generate_module(pdl_name);
-    }
 }
 
 fn generate_module(in_file: &Path) {
@@ -68,6 +41,6 @@ fn generate_module(in_file: &Path) {
     )
     .expect("PDL parse failed");
     let analyzed_file = pdl_compiler::analyzer::analyze(&parsed_file).expect("PDL analysis failed");
-    let rust_source = pdl_compiler::backends::rust_legacy::generate(&sources, &analyzed_file);
+    let rust_source = pdl_compiler::backends::rust::generate(&sources, &analyzed_file, &[]);
     out_file.write_all(rust_source.as_bytes()).expect("Could not write to output file");
 }

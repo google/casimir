@@ -17,6 +17,7 @@
 use anyhow::Result;
 use argh::FromArgs;
 use log::{error, info, warn};
+use pdl_runtime::Packet;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -29,6 +30,7 @@ use tokio::select;
 use tokio::sync::mpsc;
 
 pub mod controller;
+pub mod crc;
 pub mod packets;
 mod proto;
 
@@ -174,7 +176,7 @@ impl Device {
                             packet_bytes[0..2].copy_from_slice(&id.to_le_bytes());
 
                             // Parse the input packet.
-                            let packet = rf::RfPacket::parse(&packet_bytes)?;
+                            let packet = rf::RfPacket::decode_full(&packet_bytes)?;
 
                             // Forward the packet to other devices.
                             controller_rf_tx.send(packet)?;
@@ -188,7 +190,7 @@ impl Device {
                                 .recv()
                                 .await
                                 .ok_or(anyhow::anyhow!("rf_rx channel closed"))?;
-                            rf_writer.write(&packet.to_vec()).await?;
+                            rf_writer.write(&packet.encode_to_vec()?).await?;
                         }
                     },
                 )
@@ -248,15 +250,18 @@ impl Scene {
             device
                 .rf_tx
                 .send(
-                    rf::DeactivateNotificationBuilder {
+                    rf::DeactivateNotification {
                         type_: rf::DeactivateType::Discovery,
                         reason: rf::DeactivateReason::RfLinkLoss,
                         sender: id,
                         receiver: device.id,
+                        bitrate: rf::BitRate::BitRate106KbitS,
+                        power_level: 255,
                         technology: rf::Technology::NfcA,
                         protocol: rf::Protocol::Undetermined,
                     }
-                    .into(),
+                    .try_into()
+                    .expect("failed to serialize notification"),
                 )
                 .expect("failed to send deactive notification")
         }
@@ -266,10 +271,10 @@ impl Scene {
         let context = self.context.lock().unwrap();
         for n in 0..MAX_DEVICES {
             let Some(ref device) = self.devices[n] else { continue };
-            if packet.get_sender() != device.id
-                && (packet.get_receiver() == u16::MAX || packet.get_receiver() == device.id)
+            if packet.sender() != device.id
+                && (packet.receiver() == u16::MAX || packet.receiver() == device.id)
                 && context.get(&device.id).map(|info| info.position)
-                    == context.get(&packet.get_sender()).map(|info| info.position)
+                    == context.get(&packet.sender()).map(|info| info.position)
             {
                 device.rf_tx.send(packet.to_owned())?;
             }
