@@ -2248,8 +2248,8 @@ impl<'a> Controller<'a> {
             return Ok(());
         }
 
-        if self.state.exit_frame_start_time.is_some() {
-            let elapsed_ms = self.state.exit_frame_start_time.unwrap().elapsed().as_millis();
+        if let Some(exit_frame_start_time) = self.state.exit_frame_start_time {
+            let elapsed_ms = exit_frame_start_time.elapsed().as_millis();
             if elapsed_ms > self.state.exit_frame_timeout.as_millis() {
                 self.state.exit_frame_start_time = None;
                 self.state.passive_observe_mode =
