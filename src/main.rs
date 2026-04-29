@@ -16,9 +16,9 @@
 
 use anyhow::Result;
 use argh::FromArgs;
+use command_fds::inherited::{init_inherited_fds, take_fd_ownership};
 use log::{error, info, warn};
 use pdl_runtime::Packet;
-use rustutils::inherited_fd;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::pin::{pin, Pin};
@@ -342,7 +342,7 @@ async fn run() -> Result<()> {
 
     let nci_listener = match (opt.nci_port, opt.nci_unix_fd) {
         (None, Some(unix_fd)) => {
-            let owned_fd = inherited_fd::take_fd_ownership(unix_fd)?;
+            let owned_fd = take_fd_ownership(unix_fd)?;
             let nci_listener = std::os::unix::net::UnixListener::from(owned_fd);
             nci_listener.set_nonblocking(true)?;
             let nci_listener = UnixListener::from_std(nci_listener)?;
@@ -361,7 +361,7 @@ async fn run() -> Result<()> {
 
     let rf_listener = match (opt.rf_port, opt.rf_unix_fd) {
         (None, Some(unix_fd)) => {
-            let owned_fd = inherited_fd::take_fd_ownership(unix_fd)?;
+            let owned_fd = take_fd_ownership(unix_fd)?;
             let nci_listener = std::os::unix::net::UnixListener::from(owned_fd);
             nci_listener.set_nonblocking(true)?;
             let nci_listener = UnixListener::from_std(nci_listener)?;
@@ -409,6 +409,6 @@ async fn run() -> Result<()> {
 
 fn main() -> Result<()> {
     // Safety: First function call in the `main` function, before any other library calls
-    unsafe { inherited_fd::init_once()? };
+    unsafe { init_inherited_fds()? };
     run()
 }
