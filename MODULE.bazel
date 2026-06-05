@@ -1,0 +1,25 @@
+# Copyright 2026 The Android Open Source Project
+# SPDX-License-Identifier: Apache-2.0
+
+module(
+    name = "casimir",
+    version = "0.0.1",
+)
+
+bazel_dep(name = "rules_rust", version = "0.69.0")
+bazel_dep(name = "goldfish_crates", version = "0.0.1")
+
+lrc = use_extension("@goldfish_crates//:local_rust_crates.bzl", "lrc")
+use_repo(
+    lrc,
+    "anyhow",
+    "argh",
+    "bytes",
+    "command-fds",
+    "env_logger",
+    "futures",
+    "log",
+    "pdl-compiler",
+    "pdl-runtime",
+    "tokio",
+)
