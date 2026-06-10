@@ -1,7 +1,7 @@
 # Copyright 2026 The Android Open Source Project
 # SPDX-License-Identifier: Apache-2.0
 
-load("@rules_rust//rust:defs.bzl", "rust_binary")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -21,25 +21,42 @@ genrule(
     tools = ["@pdl-compiler//:pdlc"],
 )
 
-rust_binary(
-    name = "casimir",
-    srcs = glob(["src/**/*.rs"]) + [
+rust_library(
+    name = "casimir_lib",
+    srcs = [
+        "src/controller.rs",
+        "src/crc.rs",
+        "src/lib.rs",
+        "src/packets.rs",
         ":casimir_nci_packets_rust_gen",
         ":casimir_rf_packets_rust_gen",
     ],
+    crate_name = "casimir",
     edition = "2021",
     rustc_env = {
         "OUT_DIR": "..",
     },
     deps = [
         "@anyhow",
-        "@argh",
         "@bytes",
-        "@command-fds",
-        "@env_logger",
         "@futures",
         "@log",
         "@pdl-runtime",
+        "@tokio",
+    ],
+)
+
+rust_binary(
+    name = "casimir",
+    srcs = ["src/main.rs"],
+    edition = "2021",
+    deps = [
+        ":casimir_lib",
+        "@anyhow",
+        "@argh",
+        "@command-fds",
+        "@env_logger",
+        "@log",
         "@tokio",
     ],
 )
