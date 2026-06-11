@@ -17,87 +17,22 @@
 use anyhow::Result;
 use argh::FromArgs;
 use log::{error, info, warn};
-use pdl_runtime::Packet;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::pin::{pin, Pin};
+use std::pin::Pin;
 use std::task::Poll;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
-use tokio::net::{tcp, TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::select;
 use tokio::sync::mpsc;
 
-pub mod controller;
-pub mod crc;
-pub mod packets;
 mod proto;
 
-use controller::Controller;
-use packets::{nci, rf};
+use ::casimir::packets::rf;
+use ::casimir::Device as CasimirDevice;
+use ::casimir::Id;
+use ::casimir::MAX_DEVICES;
 use proto::{casimir, casimir_grpc};
-
-const MAX_DEVICES: usize = 128;
-type Id = u16;
-
-/// Read RF Control and Data packets received on the RF transport.
-/// Performs recombination of the segmented packets.
-pub struct RfReader {
-    socket: tcp::OwnedReadHalf,
-}
-
-/// Write RF Control and Data packets received to the RF transport.
-/// Performs segmentation of the packets.
-pub struct RfWriter {
-    socket: tcp::OwnedWriteHalf,
-}
-
-impl RfReader {
-    /// Create a new RF reader from the TCP socket half.
-    pub fn new(socket: tcp::OwnedReadHalf) -> Self {
-        RfReader { socket }
-    }
-
-    /// Read a single RF packet from the reader.
-    /// RF packets are framed with the byte size encoded as little-endian u16.
-    pub async fn read(&mut self) -> Result<Vec<u8>> {
-        const HEADER_SIZE: usize = 2;
-        let mut header_bytes = [0; HEADER_SIZE];
-
-        // Read the header bytes.
-        self.socket.read_exact(&mut header_bytes[0..HEADER_SIZE]).await?;
-        let packet_length = u16::from_le_bytes(header_bytes) as usize;
-
-        // Read the packet data.
-        let mut packet_bytes = vec![0; packet_length];
-        self.socket.read_exact(&mut packet_bytes).await?;
-
-        Ok(packet_bytes)
-    }
-}
-
-impl RfWriter {
-    /// Create a new RF writer from the TCP socket half.
-    pub fn new(socket: tcp::OwnedWriteHalf) -> Self {
-        RfWriter { socket }
-    }
-
-    /// Write a single RF packet to the writer.
-    /// RF packets are framed with the byte size encoded as little-endian u16.
-    async fn write(&mut self, packet: &[u8]) -> Result<()> {
-        let packet_length: u16 = packet.len().try_into()?;
-        let header_bytes = packet_length.to_le_bytes();
-
-        // Write the header bytes.
-        self.socket.write_all(&header_bytes).await?;
-
-        // Write the packet data.
-        self.socket.write_all(packet).await?;
-
-        Ok(())
-    }
-}
 
 /// Identify the device type.
 pub enum DeviceType {
@@ -112,107 +47,16 @@ pub struct DeviceInformation {
     r#type: DeviceType,
 }
 
-/// Represent a generic NFC device interacting on the RF transport.
-/// Devices communicate together through the RF mpsc channel.
-/// NFCCs are an instance of Device.
-pub struct Device {
-    // Unique identifier associated with the device.
-    // The identifier is assured never to be reused in the lifetime of
-    // the emulator.
-    id: Id,
-    // Async task running the controller main loop.
-    task: Pin<Box<dyn Future<Output = Result<()>>>>,
-    // Channel for injecting RF data packets into the controller instance.
-    rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
-}
-
-impl Device {
-    fn nci(
-        id: Id,
-        socket: TcpStream,
-        controller_rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
-    ) -> Device {
-        let (rf_tx, rf_rx) = mpsc::unbounded_channel();
-        Device {
-            id,
-            rf_tx,
-            task: Box::pin(async move {
-                let (nci_rx, nci_tx) = socket.into_split();
-                Controller::run(
-                    id,
-                    pin!(nci::Reader::new(nci_rx).into_stream()),
-                    nci::Writer::new(nci_tx),
-                    rf_rx,
-                    controller_rf_tx,
-                )
-                .await
-            }),
-        }
-    }
-
-    fn rf(
-        id: Id,
-        socket: TcpStream,
-        controller_rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
-    ) -> Device {
-        let (rf_tx, mut rf_rx) = mpsc::unbounded_channel();
-        Device {
-            id,
-            rf_tx,
-            task: Box::pin(async move {
-                let (socket_rx, socket_tx) = socket.into_split();
-                let mut rf_reader = RfReader::new(socket_rx);
-                let mut rf_writer = RfWriter::new(socket_tx);
-
-                let result: Result<((), ())> = futures::future::try_join(
-                    async {
-                        loop {
-                            // Replace the sender identifier in the packet
-                            // with the assigned number for the RF connection.
-                            // TODO: currently the generated API does not allow
-                            // modifying the parsed fields so the change needs to be
-                            // applied to the unparsed packet.
-                            let mut packet_bytes = rf_reader.read().await?;
-                            packet_bytes[0..2].copy_from_slice(&id.to_le_bytes());
-
-                            // Parse the input packet.
-                            let packet = rf::RfPacket::decode_full(&packet_bytes)?;
-
-                            // Forward the packet to other devices.
-                            controller_rf_tx.send(packet)?;
-                        }
-                    },
-                    async {
-                        loop {
-                            // Forward the packet to the socket connection.
-                            use pdl_runtime::Packet;
-                            let packet = rf_rx
-                                .recv()
-                                .await
-                                .ok_or(anyhow::anyhow!("rf_rx channel closed"))?;
-                            rf_writer.write(&packet.encode_to_vec()?).await?;
-                        }
-                    },
-                )
-                .await;
-
-                result?;
-                Ok(())
-            }),
-        }
-    }
-}
-
 struct Scene {
     next_id: u16,
     waker: Option<std::task::Waker>,
-    devices: [Option<Device>; MAX_DEVICES],
+    devices: [Option<CasimirDevice>; MAX_DEVICES],
     context: std::sync::Arc<std::sync::Mutex<HashMap<Id, DeviceInformation>>>,
 }
 
 impl Scene {
     fn new() -> Scene {
-        const NONE: Option<Device> = None;
+        const NONE: Option<CasimirDevice> = None;
         Scene {
             next_id: 0,
             waker: None,
@@ -227,7 +71,7 @@ impl Scene {
         }
     }
 
-    fn add_device(&mut self, builder: impl FnOnce(Id) -> Device) -> Result<Id> {
+    fn add_device(&mut self, builder: impl FnOnce(Id) -> CasimirDevice) -> Result<Id> {
         for n in 0..MAX_DEVICES {
             if self.devices[n].is_none() {
                 let id = self.next_id;
@@ -439,7 +283,8 @@ async fn run() -> Result<()> {
             result = nci_listener.accept() => {
                 let (socket, addr) = result?;
                 info!("Incoming NCI connection from {}", addr);
-                match scene.add_device(|id| Device::nci(id, socket, rf_tx.clone())) {
+                let (socket_rx, socket_tx) = socket.into_split();
+                match scene.add_device(|id| CasimirDevice::nci(id, socket_rx, socket_tx, rf_tx.clone())) {
                     Ok(id) => {
                         scene.context.lock().unwrap().insert(id, DeviceInformation {
                             id, position: id as u32, r#type: DeviceType::Nci
@@ -452,7 +297,8 @@ async fn run() -> Result<()> {
             result = rf_listener.accept() => {
                 let (socket, addr) = result?;
                 info!("Incoming RF connection from {}", addr);
-                match scene.add_device(|id| Device::rf(id, socket, rf_tx.clone())) {
+                let (socket_rx, socket_tx) = socket.into_split();
+                match scene.add_device(|id| CasimirDevice::rf(id, socket_rx, socket_tx, rf_tx.clone())) {
                     Ok(id) => {
                         scene.context.lock().unwrap().insert(id, DeviceInformation {
                             id, position: id as u32, r#type: DeviceType::Rf
