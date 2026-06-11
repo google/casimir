@@ -25,6 +25,7 @@ tokio = { version = "1.22", features = ["full", "io-util"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 grpcio = "0.13"
 protobuf = "2.8.0"
+command-fds = "0.3.3"
 
 [build-dependencies]
 pdl-compiler = "0.3.0"

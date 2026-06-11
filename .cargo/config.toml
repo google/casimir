@@ -1,0 +1,6 @@
+[env]
+# Inject a toolchain file to force CMake policy compatibility for old dependencies (e.g. c-ares).
+CMAKE_TOOLCHAIN_FILE = { value = "toolchain.cmake", relative = true }
+# Force inclusion of <cstdint> to fix compilation with modern host compilers (GCC 13+)
+# that no longer transitively include it in headers used by boringssl-sys/grpcio-sys.
+CXXFLAGS = "-include cstdint"
