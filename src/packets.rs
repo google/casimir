@@ -71,18 +71,18 @@ pub mod nci {
     /// Read NCI Control and Data packets received on the NCI transport.
     /// Performs recombination of the segmented packets.
     pub struct Reader {
-        socket: Pin<Box<dyn AsyncRead>>,
+        socket: Pin<Box<dyn AsyncRead + Send>>,
     }
 
     /// Write NCI Control and Data packets received to the NCI transport.
     /// Performs segmentation of the packets.
     pub struct Writer {
-        socket: Pin<Box<dyn AsyncWrite>>,
+        socket: Pin<Box<dyn AsyncWrite + Send>>,
     }
 
     impl Reader {
         /// Create an NCI reader from an NCI transport.
-        pub fn new<T: AsyncRead + 'static>(rx: T) -> Self {
+        pub fn new<T: AsyncRead + Send + 'static>(rx: T) -> Self {
             Reader { socket: Box::pin(rx) }
         }
 
@@ -120,7 +120,7 @@ pub mod nci {
             }
         }
 
-        pub fn into_stream(self) -> impl Stream<Item = anyhow::Result<Vec<u8>>> {
+        pub fn into_stream(self) -> impl Stream<Item = anyhow::Result<Vec<u8>>> + Send {
             stream::try_unfold(self, |mut reader| async move {
                 Ok(Some((reader.read().await?, reader)))
             })
@@ -128,11 +128,11 @@ pub mod nci {
     }
 
     /// A mutable reference to the stream returned by into_stream
-    pub type StreamRefMut<'a> = Pin<&'a mut dyn Stream<Item = anyhow::Result<Vec<u8>>>>;
+    pub type StreamRefMut<'a> = Pin<&'a mut (dyn Stream<Item = anyhow::Result<Vec<u8>>> + Send)>;
 
     impl Writer {
         /// Create an NCI writer from an NCI transport.
-        pub fn new<T: AsyncWrite + 'static>(rx: T) -> Self {
+        pub fn new<T: AsyncWrite + Send + 'static>(rx: T) -> Self {
             Writer { socket: Box::pin(rx) }
         }
 

@@ -24,7 +24,6 @@ use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::select;
-use tokio::sync::mpsc;
 
 #[derive(FromArgs, Debug)]
 /// Nfc emulator.
@@ -53,7 +52,7 @@ enum Listener {
 impl Listener {
     async fn accept_split(
         &self,
-    ) -> Result<(Pin<Box<dyn AsyncRead>>, Pin<Box<dyn AsyncWrite>>, String)> {
+    ) -> Result<(Pin<Box<dyn AsyncRead + Send>>, Pin<Box<dyn AsyncWrite + Send>>, String)> {
         match self {
             Listener::Tcp(tcp) => {
                 let (socket, addr) = tcp.accept().await?;
@@ -115,14 +114,13 @@ async fn run() -> Result<()> {
         _ => anyhow::bail!("Specify at most one of `--rf-port` and `--rf-unix-fd`"),
     };
 
-    let (rf_tx, mut rf_rx) = mpsc::unbounded_channel();
     let mut scene = Scene::new();
     loop {
         select! {
             result = nci_listener.accept_split() => {
                 let (socket_rx, socket_tx, addr) = result?;
                 info!("Incoming NCI connection from {addr}");
-                match scene.add_device(|id| Device::nci(id, socket_rx, socket_tx, rf_tx.clone())) {
+                match scene.add_device(|id, rf_tx| Device::nci(id, socket_rx, socket_tx, rf_tx)) {
                     Ok(id) => info!("Accepted NCI connection from {addr} in slot {id}"),
                     Err(err) => error!("Failed to accept NCI connection from {addr}: {err}")
                 }
@@ -130,16 +128,12 @@ async fn run() -> Result<()> {
             result = rf_listener.accept_split() => {
                 let (socket_rx, socket_tx, addr) = result?;
                 info!("Incoming RF connection from {addr}");
-                match scene.add_device(|id| Device::rf(id, socket_rx, socket_tx, rf_tx.clone())) {
+                match scene.add_device(|id, rf_tx| Device::rf(id, socket_rx, socket_tx, rf_tx)) {
                     Ok(id) => info!("Accepted RF connection from {addr} in slot {id}"),
                     Err(err) => error!("Failed to accept RF connection from {addr}: {err}")
                 }
             },
             _ = &mut scene => (),
-            result = rf_rx.recv() => {
-                let packet = result.ok_or(anyhow::anyhow!("rf_rx channel closed"))?;
-                scene.send(&packet)?
-            }
         }
     }
 }

@@ -771,7 +771,7 @@ impl<'a> Controller<'a> {
         self.nci_writer.write(&packet.into().encode_to_vec()?).await
     }
 
-    async fn send_rf(
+    fn send_rf(
         &self,
         packet: impl TryInto<rf::RfPacket, Error = pdl_runtime::EncodeError>,
     ) -> Result<()> {
@@ -1237,8 +1237,8 @@ impl<'a> Controller<'a> {
         // Deselect the remote device if applicable.
         match next_state {
             RfState::PollActive { id, rf_protocol, rf_technology, .. }
-            | RfState::WaitForSelectResponse { id, rf_protocol, rf_technology, .. } => {
-                self.send_rf(rf::DeactivateNotification {
+            | RfState::WaitForSelectResponse { id, rf_protocol, rf_technology, .. } => self
+                .send_rf(rf::DeactivateNotification {
                     receiver: id,
                     protocol: rf_protocol,
                     technology: rf_technology,
@@ -1247,9 +1247,7 @@ impl<'a> Controller<'a> {
                     sender: self.id,
                     type_: cmd.deactivation_type().into(),
                     reason: rf::DeactivateReason::EndpointRequest,
-                })
-                .await?
-            }
+                })?,
             _ => (),
         }
 
@@ -1544,8 +1542,7 @@ impl<'a> Controller<'a> {
                     protocol: rf::Protocol::IsoDep,
                     technology: rf_technology,
                     data: packet.payload().into(),
-                })
-                .await?;
+                })?;
                 // Resplenish the credit count for the RF Connection.
                 self.send_control(nci::CoreConnCreditsNotification {
                     connections: vec![nci::ConnectionCredits {
@@ -1806,19 +1803,16 @@ impl<'a> Controller<'a> {
             )
         }) {
             match technology {
-                rf::Technology::NfcA => {
-                    self.send_rf(rf::NfcAPollResponse {
-                        protocol: rf::Protocol::Undetermined,
-                        receiver: cmd.sender(),
-                        sender: self.id,
-                        bitrate: rf::BitRate::BitRate106KbitS,
-                        power_level: 255,
-                        nfcid1: self.state.nfcid1(),
-                        int_protocol: self.state.config_parameters.la_sel_info >> 5,
-                        bit_frame_sdd: self.state.config_parameters.la_bit_frame_sdd,
-                    })
-                    .await?
-                }
+                rf::Technology::NfcA => self.send_rf(rf::NfcAPollResponse {
+                    protocol: rf::Protocol::Undetermined,
+                    receiver: cmd.sender(),
+                    sender: self.id,
+                    bitrate: rf::BitRate::BitRate106KbitS,
+                    power_level: 255,
+                    nfcid1: self.state.nfcid1(),
+                    int_protocol: self.state.config_parameters.la_sel_info >> 5,
+                    bit_frame_sdd: self.state.config_parameters.la_bit_frame_sdd,
+                })?,
                 // TODO(b/346715736) implement support for NFC-B technology
                 rf::Technology::NfcB => (),
                 rf::Technology::NfcF => (),
@@ -1940,8 +1934,7 @@ impl<'a> Controller<'a> {
             bitrate: rf::BitRate::BitRate106KbitS,
             power_level: 255,
             rats_response,
-        })
-        .await?;
+        })?;
 
         info!("[{}] RF_INTF_ACTIVATED_NTF", self.id);
         info!("         DiscoveryID: {:?}", nci::RfDiscoveryId::from_index(0));
@@ -2168,8 +2161,7 @@ impl<'a> Controller<'a> {
                     bitrate: rf::BitRate::BitRate106KbitS,
                     power_level: 255,
                     protocol: rf::Protocol::T2t,
-                })
-                .await?
+                })?
             }
             (nci::RfProtocolType::IsoDep, rf::Technology::NfcA) => {
                 self.send_rf(rf::T4ATSelectCommand {
@@ -2181,8 +2173,7 @@ impl<'a> Controller<'a> {
                     // Reader/Writer SHALL be FSD T4AT,MIN
                     // (set to 256 in Appendix B.6).
                     param: 0x80,
-                })
-                .await?
+                })?
             }
             (nci::RfProtocolType::NfcDep, rf::Technology::NfcA) => {
                 self.send_rf(rf::NfcDepSelectCommand {
@@ -2192,8 +2183,7 @@ impl<'a> Controller<'a> {
                     power_level: 255,
                     technology: rf::Technology::NfcA,
                     lr: 0,
-                })
-                .await?
+                })?
             }
             _ => todo!(),
         }
@@ -2298,8 +2288,7 @@ impl<'a> Controller<'a> {
                 },
                 power_level: 255,
                 payload: vec![],
-            })
-            .await?
+            })?
         }
 
         // Wait for poll responses to return.

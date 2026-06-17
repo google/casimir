@@ -39,18 +39,18 @@ pub type Id = u16;
 /// Read RF Control and Data packets received on the RF transport.
 /// Performs recombination of the segmented packets.
 pub struct RfReader {
-    socket: Pin<Box<dyn AsyncRead>>,
+    socket: Pin<Box<dyn AsyncRead + Send>>,
 }
 
 /// Write RF Control and Data packets received to the RF transport.
 /// Performs segmentation of the packets.
 pub struct RfWriter {
-    socket: Pin<Box<dyn AsyncWrite>>,
+    socket: Pin<Box<dyn AsyncWrite + Send>>,
 }
 
 impl RfReader {
     /// Create a new RF reader from an `AsyncRead` implementation.
-    pub fn new(socket: impl AsyncRead + 'static) -> Self {
+    pub fn new(socket: impl AsyncRead + Send + 'static) -> Self {
         RfReader { socket: Box::pin(socket) }
     }
 
@@ -74,7 +74,7 @@ impl RfReader {
 
 impl RfWriter {
     /// Create a new RF writer from an `AsyncWrite` implementation.
-    pub fn new(socket: impl AsyncWrite + 'static) -> Self {
+    pub fn new(socket: impl AsyncWrite + Send + 'static) -> Self {
         RfWriter { socket: Box::pin(socket) }
     }
 
@@ -103,7 +103,7 @@ pub struct Device {
     /// the emulator.
     pub id: u16,
     /// Async task running the controller main loop.
-    pub task: Pin<Box<dyn Future<Output = Result<()>>>>,
+    pub task: Pin<Box<dyn Future<Output = Result<()>> + Send>>,
     /// Channel for injecting RF data packets into the controller instance.
     pub rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
 }
@@ -112,8 +112,8 @@ impl Device {
     /// Create a new NCI device.
     pub fn nci(
         id: Id,
-        nci_rx: impl AsyncRead + 'static,
-        nci_tx: impl AsyncWrite + 'static,
+        nci_rx: impl AsyncRead + Send + 'static,
+        nci_tx: impl AsyncWrite + Send + 'static,
         controller_rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
     ) -> Device {
         let (rf_tx, rf_rx) = mpsc::unbounded_channel();
@@ -136,8 +136,8 @@ impl Device {
     /// Create a new RF device.
     pub fn rf(
         id: Id,
-        socket_rx: impl AsyncRead + 'static,
-        socket_tx: impl AsyncWrite + 'static,
+        socket_rx: impl AsyncRead + Send + 'static,
+        socket_tx: impl AsyncWrite + Send + 'static,
         controller_rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
     ) -> Device {
         let (rf_tx, mut rf_rx) = mpsc::unbounded_channel();
@@ -192,12 +192,15 @@ pub struct Scene {
     waker: Option<std::task::Waker>,
     /// List of devices in the scene.
     pub devices: [Option<Device>; MAX_DEVICES],
+    rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
+    rf_rx: Option<mpsc::UnboundedReceiver<rf::RfPacket>>,
 }
 
 impl Default for Scene {
     fn default() -> Self {
         const NONE: Option<Device> = None;
-        Scene { next_id: 0, waker: None, devices: [NONE; MAX_DEVICES] }
+        let (rf_tx, rf_rx) = mpsc::unbounded_channel();
+        Scene { next_id: 0, waker: None, devices: [NONE; MAX_DEVICES], rf_tx, rf_rx: Some(rf_rx) }
     }
 }
 
@@ -214,10 +217,13 @@ impl Scene {
     }
 
     /// Add a device to the scene.
-    pub fn add_device(&mut self, builder: impl FnOnce(Id) -> Device) -> Result<Id> {
+    pub fn add_device(
+        &mut self,
+        builder: impl FnOnce(Id, mpsc::UnboundedSender<rf::RfPacket>) -> Device,
+    ) -> Result<Id> {
         for n in 0..MAX_DEVICES {
             if self.devices[n].is_none() {
-                self.devices[n] = Some(builder(self.next_id));
+                self.devices[n] = Some(builder(self.next_id, self.rf_tx.clone()));
                 self.next_id += 1;
                 self.wake();
                 return Ok(n as Id);
@@ -254,7 +260,7 @@ impl Scene {
     }
 
     /// Send a packet to all other devices in the scene.
-    pub fn send(&self, packet: &rf::RfPacket) -> Result<()> {
+    fn send(&self, packet: &rf::RfPacket) -> Result<()> {
         for n in 0..MAX_DEVICES {
             let Some(ref device) = self.devices[n] else { continue };
             if packet.sender() != device.id
@@ -272,6 +278,15 @@ impl Future for Scene {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if let Some(mut rx) = self.rf_rx.take() {
+            while let Poll::Ready(Some(packet)) = rx.poll_recv(cx) {
+                if let Err(err) = self.send(&packet) {
+                    warn!("failed to forward RF packet: {err}");
+                }
+            }
+            self.rf_rx = Some(rx);
+        }
+
         for n in 0..MAX_DEVICES {
             let dropped = match self.devices[n] {
                 Some(ref mut device) => match device.task.as_mut().poll(cx) {
