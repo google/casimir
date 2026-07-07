@@ -19,6 +19,7 @@
 use crate::rf;
 
 /// Error describing why CRC verification failed
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CrcVerificationError {
     /// Invalid input length (<= 2 bytes) for CRC check
     InvalidInputLength,
@@ -83,15 +84,15 @@ mod test {
     #[test]
     fn test_verify_crc_type_a() {
         // Check validity of CRC16A calculation based on HLTA (SLP_REQ)
-        assert!(verify_crc(rf::Technology::NfcA, &[0x50, 0x00, 0x57, 0xcd]).is_ok());
+        verify_crc(rf::Technology::NfcA, &[0x50, 0x00, 0x57, 0xcd]).unwrap();
     }
 
     #[test]
     fn test_verify_crc_type_b() {
         // Check validity of crc16b based on REQB (SENSB_REQ)
-        assert!(verify_crc(rf::Technology::NfcB, &[0x05, 0x00, 0x00, 0x71, 0xff]).is_ok());
+        verify_crc(rf::Technology::NfcB, &[0x05, 0x00, 0x00, 0x71, 0xff]).unwrap();
         // Check validity of crc16b based on WUPB (ALLB_REQ)
-        assert!(verify_crc(rf::Technology::NfcB, &[0x05, 0x00, 0x08, 0x39, 0x73]).is_ok());
+        verify_crc(rf::Technology::NfcB, &[0x05, 0x00, 0x08, 0x39, 0x73]).unwrap();
     }
 
     #[test]
