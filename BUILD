@@ -1,7 +1,7 @@
 # Copyright 2026 The Android Open Source Project
 # SPDX-License-Identifier: Apache-2.0
 
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -59,4 +59,9 @@ rust_binary(
         "@log",
         "@tokio",
     ],
+)
+
+rust_test(
+    name = "casimir_tests",
+    crate = ":casimir_lib",
 )

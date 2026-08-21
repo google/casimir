@@ -160,7 +160,7 @@ impl Device {
                             packet_bytes[0..2].copy_from_slice(&id.to_le_bytes());
 
                             // Parse the input packet.
-                            let packet = rf::RfPacket::decode_full(&packet_bytes)?;
+                            let (packet, _) = rf::RfPacket::decode(&packet_bytes)?;
 
                             // Forward the packet to other devices.
                             controller_rf_tx.send(packet)?;

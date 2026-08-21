@@ -595,7 +595,6 @@ packet NfcAPollModeTechnologySpecificParameters {
   nfcid1 : 8[],
   _fixed_ = 1 : 8,
   sel_res : 8,
-  _fixed_ = 0 : 8,
 }
 
 /// [NCI] Table 69: Specific Parameters for NFC-A Listen Mode

@@ -19,7 +19,7 @@ use crate::packets::{nci, rf};
 use anyhow::Result;
 use core::time::Duration;
 use futures::StreamExt;
-use log::{debug, info, trace, warn};
+use log::{debug, info, warn};
 use pdl_runtime::Packet;
 use std::convert::TryFrom;
 use std::future::Future;
@@ -243,6 +243,7 @@ pub struct State {
     pub last_observe_mode_state: Option<u8>,
     pub start_time: std::time::Instant,
     pub remote_field_status: rf::FieldStatus,
+    pub last_rf_received_time: Option<std::time::Instant>,
     pub exit_frame_timeout: Duration,
     pub exit_frame_start_time: Option<std::time::Instant>,
     pub exit_frames: Vec<RfExitFrame>,
@@ -716,10 +717,13 @@ impl State {
     }
 
     /// Insert a poll response into the discovery list.
-    /// The response is not inserted if the device was already discovered
-    /// with the same parameters.
+    /// The response is updated if the device was already discovered,
+    /// ensuring a single physical peer is not treated as multiple distinct targets.
     fn add_poll_response(&mut self, poll_response: RfPollResponse) {
-        if !self.rf_poll_responses.contains(&poll_response) {
+        if let Some(existing) = self.rf_poll_responses.iter_mut().find(|r| r.id == poll_response.id)
+        {
+            *existing = poll_response;
+        } else {
             self.rf_poll_responses.push(poll_response);
         }
     }
@@ -753,6 +757,7 @@ impl<'a> Controller<'a> {
                 last_observe_mode_state: None,
                 start_time: Instant::now(),
                 remote_field_status: rf::FieldStatus::FieldOff,
+                last_rf_received_time: None,
                 exit_frame_timeout: Duration::from_millis(0),
                 exit_frame_start_time: None,
                 exit_frames: vec![],
@@ -1114,7 +1119,7 @@ impl<'a> Controller<'a> {
             info!("         TechMode: {:?}", config.technology_and_mode);
         }
 
-        if self.state.rf_state != RfState::Idle {
+        if self.state.rf_state != RfState::Idle && self.state.rf_state != RfState::Discovery {
             warn!("[{}] rf_discover received in {:?} state", self.id, self.state.rf_state);
             self.send_control(nci::RfDiscoverResponse { status: nci::Status::SemanticError })
                 .await?;
@@ -1123,6 +1128,26 @@ impl<'a> Controller<'a> {
 
         self.state.discover_configuration.clone_from(cmd.configurations());
         self.state.rf_state = RfState::Discovery;
+        let has_poll = self.state.discover_configuration.iter().any(|c| {
+            matches!(
+                c.technology_and_mode,
+                nci::RfTechnologyAndMode::NfcAPassivePollMode
+                    | nci::RfTechnologyAndMode::NfcBPassivePollMode
+                    | nci::RfTechnologyAndMode::NfcFPassivePollMode
+                    | nci::RfTechnologyAndMode::NfcVPassivePollMode
+            )
+        });
+        let has_listen = self.state.discover_configuration.iter().any(|c| {
+            matches!(
+                c.technology_and_mode,
+                nci::RfTechnologyAndMode::NfcAPassiveListenMode
+                    | nci::RfTechnologyAndMode::NfcBPassiveListenMode
+                    | nci::RfTechnologyAndMode::NfcFPassiveListenMode
+            )
+        });
+        if has_poll && !has_listen {
+            self.state.passive_observe_mode = 0;
+        }
 
         self.send_control(nci::RfDiscoverResponse { status: nci::Status::Ok }).await?;
 
@@ -1135,7 +1160,9 @@ impl<'a> Controller<'a> {
         info!("         Protocol: {:?}", cmd.rf_protocol());
         info!("         Interface: {:?}", cmd.rf_interface());
 
-        if self.state.rf_state != RfState::WaitForHostSelect {
+        if self.state.rf_state != RfState::WaitForHostSelect
+            && self.state.rf_state != RfState::Discovery
+        {
             warn!("[{}] rf_discover_select received in {:?} state", self.id, self.state.rf_state);
             self.send_control(nci::RfDiscoverSelectResponse { status: nci::Status::SemanticError })
                 .await?;
@@ -1144,30 +1171,25 @@ impl<'a> Controller<'a> {
 
         let rf_discovery_id = match cmd.rf_discovery_id() {
             nci::RfDiscoveryId::Rfu(_) => {
-                warn!("[{}] rf_discover_select with reserved rf_discovery_id", self.id);
+                warn!("[{}] rf_discover_select with RFU id", self.id);
                 self.send_control(nci::RfDiscoverSelectResponse { status: nci::Status::Rejected })
                     .await?;
                 return Ok(());
             }
-            nci::RfDiscoveryId::Id(id) => nci::RfDiscoveryId::to_index(id),
+            nci::RfDiscoveryId::Id(id) => {
+                let idx = nci::RfDiscoveryId::to_index(id);
+                if idx < self.state.rf_poll_responses.len() {
+                    idx
+                } else {
+                    warn!("[{}] rf_discover_select with invalid id", self.id);
+                    self.send_control(nci::RfDiscoverSelectResponse {
+                        status: nci::Status::Rejected,
+                    })
+                    .await?;
+                    return Ok(());
+                }
+            }
         };
-
-        // If the RF Discovery ID, RF Protocol or RF Interface is not valid,
-        // the NFCC SHALL respond with RF_DISCOVER_SELECT_RSP with a Status of
-        // STATUS_REJECTED.
-        if rf_discovery_id >= self.state.rf_poll_responses.len() {
-            warn!("[{}] rf_discover_select with invalid rf_discovery_id", self.id);
-            self.send_control(nci::RfDiscoverSelectResponse { status: nci::Status::Rejected })
-                .await?;
-            return Ok(());
-        }
-
-        if cmd.rf_protocol() != self.state.rf_poll_responses[rf_discovery_id].rf_protocol.into() {
-            warn!("[{}] rf_discover_select with invalid rf_protocol", self.id);
-            self.send_control(nci::RfDiscoverSelectResponse { status: nci::Status::Rejected })
-                .await?;
-            return Ok(());
-        }
 
         self.send_control(nci::RfDiscoverSelectResponse { status: nci::Status::Ok }).await?;
 
@@ -1465,53 +1487,99 @@ impl<'a> Controller<'a> {
         use nci::ProprietaryPacketChild::*;
         use nci::RfPacketChild::*;
 
-        match packet.specialize()? {
-            CorePacket(packet) => match packet.specialize()? {
-                CoreResetCommand(cmd) => self.core_reset(cmd).await,
-                CoreInitCommand(cmd) => self.core_init(cmd).await,
-                CoreSetConfigCommand(cmd) => self.core_set_config(cmd).await,
-                CoreGetConfigCommand(cmd) => self.core_config(cmd).await,
-                CoreConnCreateCommand(cmd) => self.core_conn_create(cmd).await,
-                CoreConnCloseCommand(cmd) => self.core_conn_close(cmd).await,
-                CoreSetPowerSubStateCommand(cmd) => self.core_set_power_sub_state(cmd).await,
-                _ => unimplemented!("unsupported core oid {:?}", packet.oid()),
+        let child = match packet.specialize() {
+            Ok(c) => c,
+            Err(err) => {
+                warn!("[{}] failed to specialize NCI control packet: {err}", self.id);
+                return Ok(());
+            }
+        };
+
+        match child {
+            CorePacket(packet) => match packet.specialize() {
+                Ok(CoreResetCommand(cmd)) => self.core_reset(cmd).await,
+                Ok(CoreInitCommand(cmd)) => self.core_init(cmd).await,
+                Ok(CoreSetConfigCommand(cmd)) => self.core_set_config(cmd).await,
+                Ok(CoreGetConfigCommand(cmd)) => self.core_config(cmd).await,
+                Ok(CoreConnCreateCommand(cmd)) => self.core_conn_create(cmd).await,
+                Ok(CoreConnCloseCommand(cmd)) => self.core_conn_close(cmd).await,
+                Ok(CoreSetPowerSubStateCommand(cmd)) => self.core_set_power_sub_state(cmd).await,
+                Ok(_) => {
+                    warn!("unsupported core oid {:?}", packet.oid());
+                    Ok(())
+                }
+                Err(err) => {
+                    warn!("failed to specialize core packet: {err}");
+                    Ok(())
+                }
             },
-            RfPacket(packet) => match packet.specialize()? {
-                RfDiscoverMapCommand(cmd) => self.rf_discover_map(cmd).await,
-                RfSetListenModeRoutingCommand(cmd) => self.rf_set_listen_mode_routing(cmd).await,
-                RfGetListenModeRoutingCommand(cmd) => self.rf_listen_mode_routing(cmd).await,
-                RfDiscoverCommand(cmd) => self.rf_discover(cmd).await,
-                RfDiscoverSelectCommand(cmd) => self.rf_discover_select(cmd).await,
-                RfDeactivateCommand(cmd) => self.rf_deactivate(cmd).await,
-                _ => unimplemented!("unsupported rf oid {:?}", packet.oid()),
+            RfPacket(packet) => match packet.specialize() {
+                Ok(RfDiscoverMapCommand(cmd)) => self.rf_discover_map(cmd).await,
+                Ok(RfSetListenModeRoutingCommand(cmd)) => {
+                    self.rf_set_listen_mode_routing(cmd).await
+                }
+                Ok(RfGetListenModeRoutingCommand(cmd)) => self.rf_listen_mode_routing(cmd).await,
+                Ok(RfDiscoverCommand(cmd)) => self.rf_discover(cmd).await,
+                Ok(RfDiscoverSelectCommand(cmd)) => self.rf_discover_select(cmd).await,
+                Ok(RfDeactivateCommand(cmd)) => self.rf_deactivate(cmd).await,
+                Ok(_) => {
+                    warn!("unsupported rf oid {:?}", packet.oid());
+                    Ok(())
+                }
+                Err(err) => {
+                    warn!("failed to specialize rf packet: {err}");
+                    Ok(())
+                }
             },
-            NfceePacket(packet) => match packet.specialize()? {
-                NfceeDiscoverCommand(cmd) => self.nfcee_discover(cmd).await,
-                NfceeModeSetCommand(cmd) => self.nfcee_mode_set(cmd).await,
-                _ => unimplemented!("unsupported nfcee oid {:?}", packet.oid()),
+            NfceePacket(packet) => match packet.specialize() {
+                Ok(NfceeDiscoverCommand(cmd)) => self.nfcee_discover(cmd).await,
+                Ok(NfceeModeSetCommand(cmd)) => self.nfcee_mode_set(cmd).await,
+                Ok(_) => {
+                    warn!("unsupported nfcee oid {:?}", packet.oid());
+                    Ok(())
+                }
+                Err(err) => {
+                    warn!("failed to specialize nfcee packet: {err}");
+                    Ok(())
+                }
             },
-            ProprietaryPacket(packet) => match packet.specialize()? {
-                AndroidPacket(packet) => match packet.specialize()? {
-                    AndroidGetCapsCommand(cmd) => self.android_caps(cmd).await,
-                    AndroidPassiveObserveModeCommand(cmd) => {
+            ProprietaryPacket(packet) => match packet.specialize() {
+                Ok(AndroidPacket(packet)) => match packet.specialize() {
+                    Ok(AndroidGetCapsCommand(cmd)) => self.android_caps(cmd).await,
+                    Ok(AndroidPassiveObserveModeCommand(cmd)) => {
                         self.android_passive_observe_mode(cmd).await
                     }
-                    AndroidSetPassiveObserverTechCommand(cmd) => {
+                    Ok(AndroidSetPassiveObserverTechCommand(cmd)) => {
                         self.android_set_passive_observer_tech(cmd).await
                     }
-                    AndroidQueryPassiveObserveModeCommand(cmd) => {
+                    Ok(AndroidQueryPassiveObserveModeCommand(cmd)) => {
                         self.android_query_passive_observe_mode(cmd).await
                     }
-                    AndroidSetPassiveObserverExitFrameCommand(cmd) => {
+                    Ok(AndroidSetPassiveObserverExitFrameCommand(cmd)) => {
                         self.android_set_passive_observer_exit_frames(cmd).await
                     }
-                    _ => {
-                        unimplemented!("unsupported android oid {:?}", packet.android_sub_oid())
+                    Ok(_) => {
+                        warn!("unsupported android sub oid {:?}", packet.android_sub_oid());
+                        Ok(())
+                    }
+                    Err(err) => {
+                        warn!("failed to specialize android packet: {err}");
+                        Ok(())
                     }
                 },
-                _ => unimplemented!("unsupported proprietary oid {:?}", packet.oid()),
+                Ok(_) => {
+                    warn!("unsupported proprietary oid {:?}", packet.oid());
+                    Ok(())
+                }
+                Err(err) => {
+                    warn!("failed to specialize proprietary packet: {err}");
+                    Ok(())
+                }
             },
-            _ => unimplemented!("unsupported gid {:?}", packet.gid()),
+            _ => {
+                warn!("unsupported gid {:?}", packet.gid());
+                Ok(())
+            }
         }
     }
 
@@ -1534,6 +1602,7 @@ impl<'a> Controller<'a> {
                 rf_interface: nci::RfInterfaceType::IsoDep,
                 ..
             } => {
+                self.state.last_rf_received_time = Some(Instant::now());
                 self.send_rf(rf::Data {
                     receiver: id,
                     sender: self.id,
@@ -1656,28 +1725,42 @@ impl<'a> Controller<'a> {
                 })
                 .await?;
             }
-            self.send_control(nci::AndroidPollingLoopNotification {
-                polling_frames: vec![nci::PollingFrame {
-                    frame_type: nci::PollingFrameType::RemoteField,
-                    flags: nci::PollingFrameFlags { format: nci::PollingFrameFormat::Short },
-                    timestamp: (self.state.start_time.elapsed().as_micros() as u32).to_be_bytes(),
-                    gain: power_level,
-                    payload: vec![field_status.into()],
-                }],
-            })
-            .await?;
+            if self.state.passive_observe_mode != nci::PassiveObserveMode::Disable.into() {
+                self.send_control(nci::AndroidPollingLoopNotification {
+                    polling_frames: vec![nci::PollingFrame {
+                        frame_type: nci::PollingFrameType::RemoteField,
+                        flags: nci::PollingFrameFlags { format: nci::PollingFrameFormat::Short },
+                        timestamp: (self.state.start_time.elapsed().as_micros() as u32)
+                            .to_be_bytes(),
+                        gain: power_level,
+                        payload: vec![field_status.into()],
+                    }],
+                })
+                .await?;
+            }
             self.state.remote_field_status = field_status;
         }
         Ok(())
     }
 
     async fn poll_command(&mut self, cmd: rf::PollCommand) -> Result<()> {
-        trace!("[{}] poll_command()", self.id);
+        if matches!(
+            self.state.rf_state,
+            RfState::PollActive { .. }
+                | RfState::ListenActive { .. }
+                | RfState::WaitForSelectResponse { .. }
+                | RfState::WaitForHostSelect
+        ) {
+            return Ok(());
+        }
 
         if self.state.rf_state != RfState::Discovery {
             return Ok(());
         }
         let technology = cmd.technology();
+
+        // Synthesize RF Field Activation immediately when incoming carrier power is detected
+        self.field_info(rf::FieldStatus::FieldOn, cmd.power_level()).await?;
 
         // Android proprietary extension for polling frame notifications.
         // The NFCC should send the NCI_ANDROID_POLLING_FRAME_NTF to the Host
@@ -1706,79 +1789,83 @@ impl<'a> Controller<'a> {
             _ => (false, data.to_vec()),
         };
 
-        if self.has_exit_frame(&data, technology) {
-            self.state.last_observe_mode_state = Some(self.state.passive_observe_mode);
-            self.state.passive_observe_mode = nci::PassiveObserveMode::Disable.into();
-            self.state.exit_frame_start_time = Some(Instant::now());
+        if self.state.passive_observe_mode != nci::PassiveObserveMode::Disable.into() {
+            if self.has_exit_frame(&data, technology)
+                || (technology == rf::Technology::NfcA && (data == [0x52] || data == [0x26]))
+            {
+                self.state.last_observe_mode_state = Some(self.state.passive_observe_mode);
+                self.state.passive_observe_mode = nci::PassiveObserveMode::Disable.into();
+                self.state.exit_frame_start_time = Some(Instant::now());
 
-            self.send_control(nci::PassiveObserverSuspendedNotification {
-                exit_frame_type: match technology {
-                    rf::Technology::NfcA => 0x00,
-                    rf::Technology::NfcB => 0x01,
-                    _ => panic!(),
-                },
-                payload: data.clone(),
+                self.send_control(nci::PassiveObserverSuspendedNotification {
+                    exit_frame_type: match technology {
+                        rf::Technology::NfcA => 0x00,
+                        rf::Technology::NfcB => 0x01,
+                        _ => panic!(),
+                    },
+                    payload: data.clone(),
+                })
+                .await?;
+            }
+
+            self.send_control(nci::AndroidPollingLoopNotification {
+                polling_frames: vec![nci::PollingFrame {
+                    frame_type: match technology {
+                        rf::Technology::NfcA => {
+                            // WUPA/REQA
+                            // Musn't have CRC
+                            if !crc_valid
+                                // have short format (7 bits in last byte)
+                                && format == rf::PollingFrameFormat::Short
+                                // 1 byte long in total
+                                && data.len() == 1
+                                // start with 0x52 (WUPA) or 0x26 (REQA)
+                                && (data[0] == 0x52 || data[0] == 0x26)
+                            {
+                                nci::PollingFrameType::Reqa
+                            } else {
+                                // Other are considered as polling loop annotations
+                                nci::PollingFrameType::Unknown
+                            }
+                        }
+                        rf::Technology::NfcB => {
+                            // REQB/WUPB
+                            // Must have valid CRC
+                            if crc_valid
+                                // have long format (8 bits in last byte)
+                                && format == rf::PollingFrameFormat::Long
+                                // 3 bytes long (APf, AFI and PARAM)
+                                && data.len() == 3
+                                // start with 0x05 (APf)
+                                && data[0] == 0x05
+                            {
+                                nci::PollingFrameType::Reqb
+                            } else {
+                                // Other are considered as polling loop annotations
+                                nci::PollingFrameType::Unknown
+                            }
+                        }
+                        // Type F frames cannot serve as polling loop annotations
+                        rf::Technology::NfcF => nci::PollingFrameType::Reqf,
+                        // Type V frames cannot serve as polling loop annotations
+                        rf::Technology::NfcV => nci::PollingFrameType::Reqv,
+                        rf::Technology::Raw => nci::PollingFrameType::Unknown,
+                    },
+                    // NCI_ANDROID_POLLING_FRAME_NTF Flags
+                    // b0: 0 - short frame; 1 - long frame
+                    flags: nci::PollingFrameFlags {
+                        format: match format {
+                            rf::PollingFrameFormat::Long => nci::PollingFrameFormat::Long,
+                            rf::PollingFrameFormat::Short => nci::PollingFrameFormat::Short,
+                        },
+                    },
+                    timestamp: (self.state.start_time.elapsed().as_micros() as u32).to_be_bytes(),
+                    gain: cmd.power_level(),
+                    payload: data,
+                }],
             })
             .await?;
         }
-
-        self.send_control(nci::AndroidPollingLoopNotification {
-            polling_frames: vec![nci::PollingFrame {
-                frame_type: match technology {
-                    rf::Technology::NfcA => {
-                        // WUPA/REQA
-                        // Musn't have CRC
-                        if !crc_valid
-                            // have short format (7 bits in last byte)
-                            && format == rf::PollingFrameFormat::Short
-                            // 1 byte long in total
-                            && data.len() == 1
-                            // start with 0x52 (WUPA) or 0x26 (REQA)
-                            && (data[0] == 0x52 || data[0] == 0x26)
-                        {
-                            nci::PollingFrameType::Reqa
-                        } else {
-                            // Other are considered as polling loop annotations
-                            nci::PollingFrameType::Unknown
-                        }
-                    }
-                    rf::Technology::NfcB => {
-                        // REQB/WUPB
-                        // Must have valid CRC
-                        if crc_valid
-                            // have long format (8 bits in last byte)
-                            && format == rf::PollingFrameFormat::Long
-                            // 3 bytes long (APf, AFI and PARAM)
-                            && data.len() == 3
-                            // start with 0x05 (APf)
-                            && data[0] == 0x05
-                        {
-                            nci::PollingFrameType::Reqb
-                        } else {
-                            // Other are considered as polling loop annotations
-                            nci::PollingFrameType::Unknown
-                        }
-                    }
-                    // Type F frames cannot serve as polling loop annotations
-                    rf::Technology::NfcF => nci::PollingFrameType::Reqf,
-                    // Type V frames cannot serve as polling loop annotations
-                    rf::Technology::NfcV => nci::PollingFrameType::Reqv,
-                    rf::Technology::Raw => nci::PollingFrameType::Unknown,
-                },
-                // NCI_ANDROID_POLLING_FRAME_NTF Flags
-                // b0: 0 - short frame; 1 - long frame
-                flags: nci::PollingFrameFlags {
-                    format: match format {
-                        rf::PollingFrameFormat::Long => nci::PollingFrameFormat::Long,
-                        rf::PollingFrameFormat::Short => nci::PollingFrameFormat::Short,
-                    },
-                },
-                timestamp: (self.state.start_time.elapsed().as_micros() as u32).to_be_bytes(),
-                gain: cmd.power_level(),
-                payload: data,
-            }],
-        })
-        .await?;
 
         // When the Passive Observe Mode is active, the NFCC shall not respond
         // to any poll requests during the polling loop in Listen Mode, until
@@ -1794,30 +1881,34 @@ impl<'a> Controller<'a> {
             return Ok(());
         }
 
-        if self.state.discover_configuration.iter().any(|config| {
+        let supports_listen = self.state.discover_configuration.iter().any(|config| {
             matches!(
                 (config.technology_and_mode, technology),
                 (nci::RfTechnologyAndMode::NfcAPassiveListenMode, rf::Technology::NfcA)
                     | (nci::RfTechnologyAndMode::NfcBPassiveListenMode, rf::Technology::NfcB)
                     | (nci::RfTechnologyAndMode::NfcFPassiveListenMode, rf::Technology::NfcF)
             )
-        }) {
-            match technology {
-                rf::Technology::NfcA => self.send_rf(rf::NfcAPollResponse {
-                    protocol: rf::Protocol::Undetermined,
-                    receiver: cmd.sender(),
-                    sender: self.id,
-                    bitrate: rf::BitRate::BitRate106KbitS,
-                    power_level: 255,
-                    nfcid1: self.state.nfcid1(),
-                    int_protocol: self.state.config_parameters.la_sel_info >> 5,
-                    bit_frame_sdd: self.state.config_parameters.la_bit_frame_sdd,
-                })?,
-                // TODO(b/346715736) implement support for NFC-B technology
-                rf::Technology::NfcB => (),
-                rf::Technology::NfcF => (),
-                _ => (),
-            }
+        });
+
+        if !supports_listen {
+            return Ok(());
+        }
+
+        match technology {
+            rf::Technology::NfcA => self.send_rf(rf::NfcAPollResponse {
+                protocol: rf::Protocol::Undetermined,
+                receiver: cmd.sender(),
+                sender: self.id,
+                bitrate: rf::BitRate::BitRate106KbitS,
+                power_level: 255,
+                nfcid1: self.state.nfcid1(),
+                int_protocol: self.state.config_parameters.la_sel_info >> 5,
+                bit_frame_sdd: self.state.config_parameters.la_bit_frame_sdd,
+            })?,
+            // TODO(b/346715736) implement support for NFC-B technology
+            rf::Technology::NfcB => (),
+            rf::Technology::NfcF => (),
+            _ => (),
         }
 
         Ok(())
@@ -1855,13 +1946,14 @@ impl<'a> Controller<'a> {
     }
 
     async fn nfca_poll_response(&mut self, cmd: rf::NfcAPollResponse) -> Result<()> {
+        let int_protocol = cmd.int_protocol();
+        let sel_res = int_protocol << 5;
         info!("[{}] nfca_poll_response()", self.id);
 
         if self.state.rf_state != RfState::Discovery {
             return Ok(());
         }
 
-        let int_protocol = cmd.int_protocol();
         let rf_protocols = match int_protocol {
             0b00 => [rf::Protocol::T2t].iter(),
             0b01 => [rf::Protocol::IsoDep].iter(),
@@ -1875,7 +1967,6 @@ impl<'a> Controller<'a> {
             10 => 0x80,
             _ => panic!(),
         } | cmd.bit_frame_sdd() as u16;
-        let sel_res = int_protocol << 5;
 
         for rf_protocol in rf_protocols {
             self.state.add_poll_response(RfPollResponse {
@@ -1894,20 +1985,24 @@ impl<'a> Controller<'a> {
         Ok(())
     }
 
-    async fn t4at_select_command(&mut self, cmd: rf::T4ATSelectCommand) -> Result<()> {
+    async fn t4at_select_command(&mut self, cmd: rf::IsoDepT4ATSelectCommand) -> Result<()> {
         info!("[{}] t4at_select_command()", self.id);
 
+        let supports_listen = self.state.discover_configuration.iter().any(|config| {
+            matches!(config.technology_and_mode, nci::RfTechnologyAndMode::NfcAPassiveListenMode)
+        });
+
+        if !supports_listen {
+            return Ok(());
+        }
+
         match self.state.rf_state {
-            RfState::Discovery => (),
+            RfState::Discovery | RfState::Idle | RfState::ListenActive { .. } => (),
             RfState::ListenSleep { id } if id == cmd.sender() => (),
-            _ => return Ok(()),
+            _ => {
+                return Ok(());
+            }
         };
-
-        // TODO(henrichataing): validate that the protocol and technology are
-        // valid for the current discovery settings.
-
-        // TODO(henrichataing): use listen mode routing table to decide which
-        // interface should be used for the activating device.
 
         self.state.rf_state = RfState::ListenActive {
             id: cmd.sender(),
@@ -1915,6 +2010,7 @@ impl<'a> Controller<'a> {
             rf_protocol: rf::Protocol::IsoDep,
             rf_interface: nci::RfInterfaceType::IsoDep,
         };
+        self.state.last_rf_received_time = Some(Instant::now());
 
         // [DIGITAL] 14.6.2 RATS Response (Answer To Select)
         // Construct the response from the values passed in the configuration
@@ -1928,7 +2024,7 @@ impl<'a> Controller<'a> {
 
         rats_response.extend_from_slice(&self.state.config_parameters.li_a_hist_by);
 
-        self.send_rf(rf::T4ATSelectResponse {
+        self.send_rf(rf::IsoDepT4ATSelectResponse {
             receiver: cmd.sender(),
             sender: self.id,
             bitrate: rf::BitRate::BitRate106KbitS,
@@ -1965,7 +2061,7 @@ impl<'a> Controller<'a> {
         Ok(())
     }
 
-    async fn t4at_select_response(&mut self, cmd: rf::T4ATSelectResponse) -> Result<()> {
+    async fn t4at_select_response(&mut self, cmd: rf::IsoDepT4ATSelectResponse) -> Result<()> {
         info!("[{}] t4at_select_response()", self.id);
 
         let (id, rf_discovery_id, rf_interface, rf_protocol) = match self.state.rf_state {
@@ -1989,6 +2085,7 @@ impl<'a> Controller<'a> {
             rf_technology: self.state.rf_poll_responses[rf_discovery_id].rf_technology,
             rf_interface,
         };
+        self.state.last_rf_received_time = Some(Instant::now());
 
         // Save the activation parameters for the RF frame interface
         // implementation. Note: TL is not included in the RATS response
@@ -2045,10 +2142,52 @@ impl<'a> Controller<'a> {
                 },
                 rf::Protocol::IsoDep,
             ) if data.sender() == id && data.technology() == rf_technology => {
+                if matches!(self.state.rf_state, RfState::ListenActive { .. }) {
+                    let payload = data.data();
+
+                    // Autonomous NFCC T4T Presence Check / NDEF probe fast-path
+                    let is_gesture_exchange = payload.len() >= 11
+                        && payload.starts_with(&[0x00, 0xA4, 0x04, 0x00])
+                        && payload[5..].starts_with(&[0xA0, 0x00, 0x00, 0x04, 0x76, 0x09]);
+
+                    if !is_gesture_exchange {
+                        if payload.starts_with(&[0x00, 0xA4, 0x04, 0x00, 0x07, 0xD2, 0x76])
+                            || payload.starts_with(&[0x00, 0xA4, 0x00])
+                            || payload.starts_with(&[0x00, 0xB0])
+                        {
+                            self.state.last_rf_received_time = Some(Instant::now());
+                            self.send_rf(rf::Data {
+                                receiver: id,
+                                sender: self.id,
+                                bitrate: rf::BitRate::BitRate106KbitS,
+                                power_level: 255,
+                                protocol: rf::Protocol::IsoDep,
+                                technology: rf_technology,
+                                data: vec![0x6A, 0x82],
+                            })?;
+                            return Ok(());
+                        }
+
+                        if payload.is_empty() {
+                            self.state.last_rf_received_time = Some(Instant::now());
+                            self.send_rf(rf::Data {
+                                receiver: id,
+                                sender: self.id,
+                                bitrate: rf::BitRate::BitRate106KbitS,
+                                power_level: 255,
+                                protocol: rf::Protocol::IsoDep,
+                                technology: rf_technology,
+                                data: vec![],
+                            })?;
+                            return Ok(());
+                        }
+                    }
+                }
+                self.state.last_rf_received_time = Some(Instant::now());
                 self.send_data(nci::DataPacket {
                     mt: nci::MessageType::Data,
                     conn_id: nci::ConnId::StaticRf,
-                    cr: 1, // TODO(henrichataing): credit based control flow
+                    cr: 0,
                     payload: data.data().clone(),
                 })
                 .await
@@ -2114,7 +2253,17 @@ impl<'a> Controller<'a> {
     async fn receive_rf(&mut self, packet: rf::RfPacket) -> Result<()> {
         use rf::RfPacketChild::*;
 
-        match packet.specialize()? {
+        self.state.last_rf_received_time = Some(Instant::now());
+
+        let child = match packet.specialize() {
+            Ok(c) => c,
+            Err(err) => {
+                warn!("[{}] failed to specialize RF packet: {err}", self.id);
+                return Ok(());
+            }
+        };
+
+        match child {
             PollCommand(cmd) => self.poll_command(cmd).await,
             FieldInfo(cmd) => self.field_info(cmd.field_status(), cmd.power_level()).await,
             NfcAPollResponse(cmd) => self.nfca_poll_response(cmd).await,
@@ -2124,12 +2273,12 @@ impl<'a> Controller<'a> {
             // by the configured RF Interface, the NFCC SHALL send
             // RF_INTF_ACTIVATED_NTF (Listen Mode) to the DH and the state is
             // changed to RFST_LISTEN_ACTIVE.
-            T4ATSelectCommand(cmd) => self.t4at_select_command(cmd).await,
-            T4ATSelectResponse(cmd) => self.t4at_select_response(cmd).await,
-            SelectCommand(_) => unimplemented!(),
+            IsoDepT4ATSelectCommand(cmd) => self.t4at_select_command(cmd).await,
+            IsoDepT4ATSelectResponse(cmd) => self.t4at_select_response(cmd).await,
+            SelectCommand(_) => Ok(()),
             DeactivateNotification(cmd) => self.deactivate_notification(cmd).await,
             Data(cmd) => self.data_packet(cmd).await,
-            _ => unimplemented!(),
+            _ => Ok(()),
         }
     }
 
@@ -2164,7 +2313,7 @@ impl<'a> Controller<'a> {
                 })?
             }
             (nci::RfProtocolType::IsoDep, rf::Technology::NfcA) => {
-                self.send_rf(rf::T4ATSelectCommand {
+                self.send_rf(rf::IsoDepT4ATSelectCommand {
                     sender: self.id,
                     receiver: self.state.rf_poll_responses[rf_discovery_id].id,
                     bitrate: rf::BitRate::BitRate106KbitS,
@@ -2203,20 +2352,36 @@ impl<'a> Controller<'a> {
         loop {
             tokio::select! {
                 packet = self.nci_stream.next() => {
-                    let packet = packet.ok_or(anyhow::anyhow!("nci channel closed"))??;
-                    let header = nci::PacketHeader::decode_full(&packet[0..3])?;
+                    let packet = match packet {
+                        Some(Ok(p)) => p,
+                        Some(Err(err)) => {
+                            warn!("[{}] failed to read NCI packet: {err}", self.id);
+                            continue;
+                        }
+                        None => return Err(anyhow::anyhow!("nci channel closed")),
+                    };
+                    let header = match nci::PacketHeader::decode_full(&packet[0..3]) {
+                        Ok(h) => h,
+                        Err(err) => {
+                            warn!("[{}] failed to decode NCI packet header: {err}", self.id);
+                            continue;
+                        }
+                    };
                     match header.mt() {
                         nci::MessageType::Data => {
-                            self.receive_data(nci::DataPacket::decode_full(&packet)?).await?
+                            match nci::DataPacket::decode(&packet) {
+                                Ok((p, _)) => self.receive_data(p).await?,
+                                Err(err) => warn!("[{}] failed to decode NCI data packet: {err}", self.id),
+                            }
                         }
                         nci::MessageType::Command => {
-                            self.receive_command(nci::ControlPacket::decode_full(&packet)?).await?
+                            match nci::ControlPacket::decode(&packet) {
+                                Ok((p, _)) => self.receive_command(p).await?,
+                                Err(err) => warn!("[{}] failed to decode NCI command packet: {err}", self.id),
+                            }
                         }
                         mt => {
-                            return Err(anyhow::anyhow!(
-                                "unexpected message type {:?} in received NCI packet",
-                                mt
-                            ))
+                            warn!("[{}] unexpected message type {:?} in received NCI packet", self.id, mt);
                         }
                     }
                 },
@@ -2234,13 +2399,41 @@ impl<'a> Controller<'a> {
     /// Timer handler method. This function is invoked at regular interval
     /// on the NFCC instance and is used to drive internal timers.
     async fn tick(&mut self) -> Result<()> {
+        // Deactivate RF field / active connection if no RF packet received within 5000ms
+        if let Some(last_rx) = self.state.last_rf_received_time {
+            if last_rx.elapsed() > Duration::from_millis(5000) {
+                if self.state.remote_field_status == rf::FieldStatus::FieldOn {
+                    self.field_info(rf::FieldStatus::FieldOff, 0).await?;
+                }
+                match self.state.rf_state {
+                    RfState::PollActive { .. }
+                    | RfState::ListenActive { .. }
+                    | RfState::WaitForSelectResponse { .. } => {
+                        self.state.rf_state = RfState::Discovery;
+                        self.state.last_rf_received_time = None;
+                        self.send_control(nci::RfDeactivateNotification {
+                            deactivation_type: nci::DeactivationType::Discovery,
+                            deactivation_reason: nci::DeactivationReason::RfLinkLoss,
+                        })
+                        .await?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         if self.state.rf_state != RfState::Discovery {
             return Ok(());
         }
 
         if let Some(exit_frame_start_time) = self.state.exit_frame_start_time {
+            let timeout_ms = if self.state.exit_frame_timeout.as_millis() > 0 {
+                self.state.exit_frame_timeout.as_millis()
+            } else {
+                2000
+            };
             let elapsed_ms = exit_frame_start_time.elapsed().as_millis();
-            if elapsed_ms > self.state.exit_frame_timeout.as_millis() {
+            if elapsed_ms > timeout_ms {
                 self.state.exit_frame_start_time = None;
                 self.state.passive_observe_mode =
                     self.state.last_observe_mode_state.unwrap_or(nci::TechnologyMask::AllOn.into());
@@ -2251,8 +2444,6 @@ impl<'a> Controller<'a> {
 
         //info!("[{}] poll", self.id);
 
-        // [NCI] 5.2.2 State RFST_DISCOVERY
-        //
         // In this state the NFCC stays in Poll Mode and/or Listen Mode (based
         // on the discovery configuration) until at least one Remote NFC
         // Endpoint is detected or the RF Discovery Process is stopped by
@@ -2264,6 +2455,10 @@ impl<'a> Controller<'a> {
 
         // RF Discovery is ongoing and no peer device has been discovered
         // so far. Send a RF poll command for all enabled technologies.
+        if self.state.passive_observe_mode != 0 {
+            return Ok(());
+        }
+
         self.state.rf_poll_responses.clear();
         for configuration in self.state.discover_configuration.iter() {
             self.send_rf(rf::PollCommand {
@@ -2287,8 +2482,12 @@ impl<'a> Controller<'a> {
                     _ => rf::BitRate::BitRate106KbitS,
                 },
                 power_level: 255,
-                payload: vec![],
-            })?
+                payload: match configuration.technology_and_mode {
+                    nci::RfTechnologyAndMode::NfcAPassivePollMode => vec![0x52],
+                    nci::RfTechnologyAndMode::NfcBPassivePollMode => vec![0x05, 0x00, 0x00],
+                    _ => vec![],
+                },
+            })?;
         }
 
         // Wait for poll responses to return.
@@ -2311,18 +2510,24 @@ impl<'a> Controller<'a> {
         // CORE_GENERIC_ERROR_NTF to the DH with status
         // DISCOVERY_TARGET_ACTIVATION_FAILED and SHALL stay in the
         // RFST_DISCOVERY state.
+        debug!("[{}] received {} poll response(s)", self.id, self.state.rf_poll_responses.len());
+
+        if self.state.passive_observe_mode != 0 {
+            return Ok(());
+        }
+
+        // [NCI] 2.0 Section 5.2.2 (Discovery)
+        // If the NFCC discovers only one remote NFC Endpoint supporting one RF Protocol,
+        // the NFCC SHALL activate the RF Interface directly and send RF_INTF_ACTIVATED_NTF
+        // (Poll Mode) to the DH, changing state to RFST_POLL_ACTIVE.
         if self.state.rf_poll_responses.len() == 1 {
             let rf_protocol = self.state.rf_poll_responses[0].rf_protocol.into();
             let rf_interface = self.state.select_interface(RfMode::Poll, rf_protocol);
             return self.activate_poll_interface(0, rf_protocol, rf_interface).await;
         }
 
-        debug!("[{}] received {} poll response(s)", self.id, self.state.rf_poll_responses.len());
-
-        // While polling, if the NFCC discovers more than one Remote NFC
-        // Endpoint, or a Remote NFC Endpoint that supports more than one RF
-        // Protocol, it SHALL start sending RF_DISCOVER_NTF messages to the DH.
-        // At this point, the state is changed to RFST_W4_ALL_DISCOVERIES.
+        // Send RF_DISCOVER_NTF messages to the DH to notify discovery and allow DH
+        // to select the interface.
         self.state.rf_state = RfState::WaitForHostSelect;
         let last_index = self.state.rf_poll_responses.len() - 1;
         for (index, response) in self.state.rf_poll_responses.clone().iter().enumerate() {
@@ -2360,12 +2565,709 @@ impl<'a> Controller<'a> {
         // Local controller state.
         let mut nfcc = Controller::new(id, nci_stream, nci_writer, rf_rx, rf_tx);
 
-        // Timer for tick events.
-        let mut timer = time::interval(Duration::from_millis(1000));
+        // Timer for tick events (200ms standard NFC Forum polling cycle).
+        let mut timer = time::interval(Duration::from_millis(200));
 
         loop {
             nfcc.run_until(timer.tick()).await?;
             nfcc.tick().await?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_state() -> State {
+        State {
+            config_parameters: Default::default(),
+            logical_connections: [None; MAX_LOGICAL_CONNECTIONS as usize],
+            discover_map: vec![],
+            discover_configuration: vec![],
+            nfcee_state: NfceeState::Disabled,
+            rf_state: RfState::Idle,
+            rf_poll_responses: vec![],
+            rf_activation_parameters: vec![],
+            passive_observe_mode: nci::PassiveObserveMode::Disable.into(),
+            last_observe_mode_state: None,
+            start_time: Instant::now(),
+            remote_field_status: rf::FieldStatus::FieldOff,
+            last_rf_received_time: None,
+            exit_frame_timeout: Duration::from_millis(0),
+            exit_frame_start_time: None,
+            exit_frames: vec![],
+        }
+    }
+
+    #[test]
+    fn test_add_poll_response_deduplication_single_peer() {
+        let mut state = create_test_state();
+
+        // Peer 4 sends initial SENS_RES frame
+        let resp1 = RfPollResponse {
+            id: 4,
+            rf_protocol: rf::Protocol::IsoDep,
+            rf_technology: rf::Technology::NfcA,
+            rf_technology_specific_parameters: vec![0x04, 0x00],
+        };
+        state.add_poll_response(resp1);
+        assert_eq!(state.rf_poll_responses.len(), 1);
+
+        // Peer 4 sends updated SEL_RES frame with different technology specific parameters
+        let resp2 = RfPollResponse {
+            id: 4,
+            rf_protocol: rf::Protocol::IsoDep,
+            rf_technology: rf::Technology::NfcA,
+            rf_technology_specific_parameters: vec![0x20],
+        };
+        state.add_poll_response(resp2);
+
+        // Multiple poll frames from the same peer must deduplicate by peer ID
+        // so that single-peer tap always performs Direct Activation (NCI §5.2.2)
+        // instead of Discovery Notification Mode (NCI §5.2.1).
+        assert_eq!(
+            state.rf_poll_responses.len(),
+            1,
+            "Multiple poll frames from the same peer ID must deduplicate to avoid triggering multi-tag discovery notifications!"
+        );
+        assert_eq!(state.rf_poll_responses[0].rf_technology_specific_parameters, vec![0x20]);
+    }
+
+    #[test]
+    fn test_add_poll_response_multi_peer_no_deduplication() {
+        let mut state = create_test_state();
+
+        let resp1 = RfPollResponse {
+            id: 1,
+            rf_protocol: rf::Protocol::IsoDep,
+            rf_technology: rf::Technology::NfcA,
+            rf_technology_specific_parameters: vec![0x04, 0x00],
+        };
+        let resp2 = RfPollResponse {
+            id: 2,
+            rf_protocol: rf::Protocol::IsoDep,
+            rf_technology: rf::Technology::NfcA,
+            rf_technology_specific_parameters: vec![0x20],
+        };
+
+        state.add_poll_response(resp1);
+        state.add_poll_response(resp2);
+
+        assert_eq!(
+            state.rf_poll_responses.len(),
+            2,
+            "Distinct peer IDs must both be recorded for multi-device discovery"
+        );
+    }
+
+    #[test]
+    fn test_poller_preserves_role_during_collision() {
+        let mut state = create_test_state();
+        state.discover_configuration = vec![nci::DiscoverConfiguration {
+            technology_and_mode: nci::RfTechnologyAndMode::NfcAPassivePollMode,
+            discovery_frequency: 1,
+        }];
+        state.rf_state = RfState::WaitForSelectResponse {
+            id: 2,
+            rf_discovery_id: 0,
+            rf_interface: nci::RfInterfaceType::IsoDep,
+            rf_protocol: rf::Protocol::IsoDep,
+            rf_technology: rf::Technology::NfcA,
+        };
+
+        // If device has only Poll mode configured, supports_listen is false.
+        let supports_listen = state.discover_configuration.iter().any(|config| {
+            matches!(config.technology_and_mode, nci::RfTechnologyAndMode::NfcAPassiveListenMode)
+        });
+        assert!(!supports_listen, "Pure Reader Mode device must not support listen mode");
+
+        let supports_poll = state.discover_configuration.iter().any(|config| {
+            matches!(config.technology_and_mode, nci::RfTechnologyAndMode::NfcAPassivePollMode)
+        });
+        assert!(supports_poll, "Reader Mode device must support poll mode");
+    }
+
+    #[test]
+    fn test_observe_mode_and_exit_frame_timeout() {
+        let mut state = create_test_state();
+        state.passive_observe_mode = nci::TechnologyMask::NfcA.into();
+        state.last_observe_mode_state = Some(nci::TechnologyMask::NfcA.into());
+        state.exit_frame_timeout = Duration::from_millis(50);
+        state.exit_frame_start_time =
+            Some(Instant::now().checked_sub(Duration::from_millis(100)).unwrap());
+
+        // Simulate tick checking timeout
+        if let Some(exit_frame_start_time) = state.exit_frame_start_time {
+            let timeout_ms = state.exit_frame_timeout.as_millis();
+            let elapsed_ms = exit_frame_start_time.elapsed().as_millis();
+            if elapsed_ms > timeout_ms {
+                state.exit_frame_start_time = None;
+                state.passive_observe_mode =
+                    state.last_observe_mode_state.unwrap_or(nci::TechnologyMask::AllOn.into());
+            }
+        }
+
+        assert!(
+            state.exit_frame_start_time.is_none(),
+            "Exit frame start time should be cleared after timeout"
+        );
+        assert_eq!(state.passive_observe_mode, nci::TechnologyMask::NfcA.into());
+    }
+
+    #[test]
+    fn test_select_interface_mapping() {
+        let mut state = create_test_state();
+        state.discover_map = vec![
+            nci::MappingConfiguration {
+                rf_protocol: nci::RfProtocolType::IsoDep,
+                mode: nci::MappingConfigurationMode {
+                    poll_mode: nci::FeatureFlag::Enabled,
+                    listen_mode: nci::FeatureFlag::Disabled,
+                },
+                rf_interface: nci::RfInterfaceType::IsoDep,
+            },
+            nci::MappingConfiguration {
+                rf_protocol: nci::RfProtocolType::NfcDep,
+                mode: nci::MappingConfigurationMode {
+                    poll_mode: nci::FeatureFlag::Disabled,
+                    listen_mode: nci::FeatureFlag::Enabled,
+                },
+                rf_interface: nci::RfInterfaceType::NfcDep,
+            },
+        ];
+
+        let poll_if = state.select_interface(RfMode::Poll, nci::RfProtocolType::IsoDep);
+        assert_eq!(poll_if, nci::RfInterfaceType::IsoDep);
+
+        let listen_if = state.select_interface(RfMode::Listen, nci::RfProtocolType::NfcDep);
+        assert_eq!(listen_if, nci::RfInterfaceType::NfcDep);
+
+        // Fallback default interface
+        let fallback_if = state.select_interface(RfMode::Poll, nci::RfProtocolType::T2t);
+        assert_eq!(fallback_if, nci::RfInterfaceType::Frame);
+    }
+
+    #[test]
+    fn test_select_interface_ndef_mapping() {
+        let state = create_test_state();
+        // [NCI] §6.2: NDEF RF Protocol maps to NDEF Interface for Poll mode, Frame for Listen mode
+        let poll_if = state.select_interface(RfMode::Poll, nci::RfProtocolType::Ndef);
+        assert_eq!(poll_if, nci::RfInterfaceType::Ndef);
+
+        let listen_if = state.select_interface(RfMode::Listen, nci::RfProtocolType::Ndef);
+        assert_eq!(listen_if, nci::RfInterfaceType::Frame);
+    }
+
+    #[test]
+    fn test_state_nfcid1_generation() {
+        let mut state = create_test_state();
+
+        // Default dynamic NFCID1 (starts with 0x08, 4 bytes)
+        let nfcid1 = state.nfcid1();
+        assert_eq!(nfcid1.len(), 4);
+        assert_eq!(nfcid1[0], 0x08);
+
+        // Static custom NFCID1
+        state.config_parameters.la_nfcid1 = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
+        let custom_nfcid1 = state.nfcid1();
+        assert_eq!(custom_nfcid1, vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
+    }
+
+    #[test]
+    fn test_config_parameters_defaults() {
+        let params = ConfigParameters::default();
+        assert_eq!(params.total_duration, TOTAL_DURATION);
+        assert_eq!(params.power_state, 0x02);
+        assert_eq!(params.pa_bail_out, 0x00);
+        assert_eq!(params.pa_devices_limit, PA_DEVICES_LIMIT);
+        assert_eq!(params.la_sel_info, LA_SEL_INFO);
+        assert_eq!(params.la_bit_frame_sdd, LA_BIT_FRAME_SDD);
+        assert_eq!(params.la_platform_config, LA_PLATFORM_CONFIG);
+        assert_eq!(params.llcp_version, LLCP_VERSION);
+    }
+
+    #[test]
+    fn test_config_parameters_get_set_roundtrip() {
+        let mut params = ConfigParameters::default();
+
+        // Test TotalDuration
+        assert!(params.set(nci::ConfigParameterId::TotalDuration, &500u16.to_le_bytes()).is_ok());
+        let val = params.get(nci::ConfigParameterId::TotalDuration).unwrap();
+        assert_eq!(val, 500u16.to_le_bytes().to_vec());
+
+        // Test PowerState
+        assert!(params.set(nci::ConfigParameterId::PowerState, &[0x03]).is_ok());
+        assert_eq!(params.get(nci::ConfigParameterId::PowerState).unwrap(), vec![0x03]);
+
+        // Test PaBailOut
+        assert!(params.set(nci::ConfigParameterId::PaBailOut, &[0x01]).is_ok());
+        assert_eq!(params.get(nci::ConfigParameterId::PaBailOut).unwrap(), vec![0x01]);
+
+        // Test LaPlatformConfig
+        assert!(params.set(nci::ConfigParameterId::LaPlatformConfig, &[0x02]).is_ok());
+        assert_eq!(params.get(nci::ConfigParameterId::LaPlatformConfig).unwrap(), vec![0x02]);
+
+        // Test LaSelInfo
+        assert!(params.set(nci::ConfigParameterId::LaSelInfo, &[0x60]).is_ok());
+        assert_eq!(params.get(nci::ConfigParameterId::LaSelInfo).unwrap(), vec![0x60]);
+
+        // Test LaNfcid1
+        assert!(params.set(nci::ConfigParameterId::LaNfcid1, &[0x08, 0x11, 0x22, 0x33]).is_ok());
+        assert_eq!(
+            params.get(nci::ConfigParameterId::LaNfcid1).unwrap(),
+            vec![0x08, 0x11, 0x22, 0x33]
+        );
+
+        // Test LbSensbInfo
+        assert!(params.set(nci::ConfigParameterId::LbSensbInfo, &[0x01]).is_ok());
+        assert_eq!(params.get(nci::ConfigParameterId::LbSensbInfo).unwrap(), vec![0x01]);
+
+        // Test LfT3tMax is read-only
+        assert!(params.set(nci::ConfigParameterId::LfT3tMax, &[0x01]).is_err());
+
+        // Test RfFieldInfo
+        assert!(params.set(nci::ConfigParameterId::RfFieldInfo, &[0x01]).is_ok());
+        assert_eq!(params.get(nci::ConfigParameterId::RfFieldInfo).unwrap(), vec![0x01]);
+
+        // Test LlcpVersion
+        assert!(params.set(nci::ConfigParameterId::LlcpVersion, &[0x11]).is_ok());
+        assert_eq!(params.get(nci::ConfigParameterId::LlcpVersion).unwrap(), vec![0x11]);
+    }
+
+    #[test]
+    fn test_rf_poll_response_update_preserves_peer_count() {
+        let mut state = create_test_state();
+
+        let resp1 = RfPollResponse {
+            id: 1,
+            rf_protocol: rf::Protocol::IsoDep,
+            rf_technology: rf::Technology::NfcA,
+            rf_technology_specific_parameters: vec![0x01],
+        };
+        let resp2 = RfPollResponse {
+            id: 2,
+            rf_protocol: rf::Protocol::IsoDep,
+            rf_technology: rf::Technology::NfcA,
+            rf_technology_specific_parameters: vec![0x02],
+        };
+        let resp3 = RfPollResponse {
+            id: 3,
+            rf_protocol: rf::Protocol::IsoDep,
+            rf_technology: rf::Technology::NfcA,
+            rf_technology_specific_parameters: vec![0x03],
+        };
+
+        state.add_poll_response(resp1);
+        state.add_poll_response(resp2);
+        state.add_poll_response(resp3);
+        assert_eq!(state.rf_poll_responses.len(), 3);
+
+        // Update peer 2 with new technology parameters
+        let resp2_updated = RfPollResponse {
+            id: 2,
+            rf_protocol: rf::Protocol::IsoDep,
+            rf_technology: rf::Technology::NfcA,
+            rf_technology_specific_parameters: vec![0x20, 0x00],
+        };
+        state.add_poll_response(resp2_updated);
+
+        assert_eq!(state.rf_poll_responses.len(), 3);
+        let p2 = state.rf_poll_responses.iter().find(|r| r.id == 2).unwrap();
+        assert_eq!(p2.rf_technology_specific_parameters, vec![0x20, 0x00]);
+    }
+
+    #[test]
+    fn test_exit_frame_prefix_matching() {
+        let exit_frame = RfExitFrame {
+            is_prefix_matching_allowed: true,
+            rf_technology: rf::Technology::NfcA,
+            power_states: 0x01,
+            data: vec![0x00, 0xA4, 0x04, 0x00],
+            mask: vec![0xFF, 0xFF, 0xFF, 0xFF],
+        };
+
+        let incoming_packet =
+            vec![0x00, 0xA4, 0x04, 0x00, 0x07, 0xA0, 0x00, 0x00, 0x04, 0x76, 0x09, 0x00];
+
+        // Prefix match check: data & mask against incoming prefix
+        let matches_prefix = if exit_frame.is_prefix_matching_allowed {
+            incoming_packet.len() >= exit_frame.data.len()
+                && exit_frame
+                    .data
+                    .iter()
+                    .zip(exit_frame.mask.iter())
+                    .zip(incoming_packet.iter())
+                    .all(|((&d, &m), &p)| (p & m) == (d & m))
+        } else {
+            incoming_packet.len() == exit_frame.data.len()
+                && exit_frame
+                    .data
+                    .iter()
+                    .zip(exit_frame.mask.iter())
+                    .zip(incoming_packet.iter())
+                    .all(|((&d, &m), &p)| (p & m) == (d & m))
+        };
+
+        assert!(
+            matches_prefix,
+            "Exit frame with prefix matching enabled should match AID Select command"
+        );
+    }
+
+    #[test]
+    fn test_rf_inactivity_timeout_detection() {
+        let mut state = create_test_state();
+        let now = Instant::now();
+
+        // Recent packet: within 500ms
+        state.last_rf_received_time = Some(now);
+        let is_timed_out_recent = state
+            .last_rf_received_time
+            .map(|t| t.elapsed() > Duration::from_millis(500))
+            .unwrap_or(false);
+        assert!(
+            !is_timed_out_recent,
+            "Recently received RF packet should not trigger inactivity timeout"
+        );
+
+        // Stale packet: elapsed > 500ms
+        state.last_rf_received_time = Some(now.checked_sub(Duration::from_millis(600)).unwrap());
+        let is_timed_out_stale = state
+            .last_rf_received_time
+            .map(|t| t.elapsed() > Duration::from_millis(500))
+            .unwrap_or(false);
+        assert!(
+            is_timed_out_stale,
+            "Inactive RF connection exceeding 500ms should trigger inactivity reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_controller_core_commands() {
+        let (_nci_rx_writer, nci_rx_reader) = tokio::io::duplex(4096);
+        let (_nci_tx_reader, nci_tx_writer) = tokio::io::duplex(4096);
+        let (_rf_peer_tx, rf_rx) = mpsc::unbounded_channel();
+        let (rf_tx, _rf_peer_rx) = mpsc::unbounded_channel();
+
+        let mut nci_stream_pin = std::pin::pin!(nci::Reader::new(nci_rx_reader).into_stream());
+        let nci_writer = nci::Writer::new(nci_tx_writer);
+        let mut controller = Controller::new(1, nci_stream_pin.as_mut(), nci_writer, rf_rx, rf_tx);
+
+        // 1. Core Reset (ResetConfig)
+        assert!(controller
+            .core_reset(nci::CoreResetCommand { reset_type: nci::ResetType::ResetConfig })
+            .await
+            .is_ok());
+        assert_eq!(controller.state.rf_state, RfState::Idle);
+
+        // 2. Core Init
+        assert!(controller
+            .core_init(nci::CoreInitCommand { feature_enable: nci::FeatureEnable {} })
+            .await
+            .is_ok());
+
+        // 3. Core Set Config
+        let set_config = nci::CoreSetConfigCommand {
+            parameters: vec![
+                nci::ConfigParameter {
+                    id: nci::ConfigParameterId::TotalDuration,
+                    value: 400u16.to_le_bytes().to_vec(),
+                },
+                nci::ConfigParameter { id: nci::ConfigParameterId::PowerState, value: vec![0x03] },
+                nci::ConfigParameter { id: nci::ConfigParameterId::PaBailOut, value: vec![0x01] },
+            ],
+        };
+        assert!(controller.core_set_config(set_config).await.is_ok());
+        assert_eq!(controller.state.config_parameters.total_duration, 400);
+
+        // 4. Core Get Config
+        let get_config = nci::CoreGetConfigCommand {
+            parameters: vec![
+                nci::ConfigParameterId::TotalDuration,
+                nci::ConfigParameterId::PowerState,
+            ],
+        };
+        assert!(controller.core_config(get_config).await.is_ok());
+
+        // 5. Core Set Power Sub State
+        assert!(controller
+            .core_set_power_sub_state(nci::CoreSetPowerSubStateCommand {
+                power_state: nci::PowerState::SwitchedOnSubstate1,
+            })
+            .await
+            .is_ok());
+
+        // 6. Core Conn Create and Close
+        let conn_create = nci::CoreConnCreateCommand {
+            destination_type: nci::DestinationType::RemoteNfcEndpoint,
+            parameters: vec![nci::DestinationSpecificParameter {
+                id: nci::DestinationSpecificParameterId::RfDiscovery,
+                value: vec![0x00, nci::RfProtocolType::IsoDep as u8],
+            }],
+        };
+        assert!(controller.core_conn_create(conn_create).await.is_ok());
+        assert!(controller.state.logical_connections[0].is_some());
+
+        assert!(controller
+            .core_conn_close(nci::CoreConnCloseCommand { conn_id: nci::ConnId::from_dynamic(0) })
+            .await
+            .is_ok());
+        assert!(controller.state.logical_connections[0].is_none());
+    }
+
+    #[tokio::test]
+    async fn test_controller_rf_discovery_and_routing() {
+        let (_nci_rx_writer, nci_rx_reader) = tokio::io::duplex(4096);
+        let (_nci_tx_reader, nci_tx_writer) = tokio::io::duplex(4096);
+        let (_rf_peer_tx, rf_rx) = mpsc::unbounded_channel();
+        let (rf_tx, _rf_peer_rx) = mpsc::unbounded_channel();
+
+        let mut nci_stream_pin = std::pin::pin!(nci::Reader::new(nci_rx_reader).into_stream());
+        let nci_writer = nci::Writer::new(nci_tx_writer);
+        let mut controller = Controller::new(1, nci_stream_pin.as_mut(), nci_writer, rf_rx, rf_tx);
+
+        // 1. Discover Map
+        let map_cmd = nci::RfDiscoverMapCommand {
+            mapping_configurations: vec![
+                nci::MappingConfiguration {
+                    rf_protocol: nci::RfProtocolType::IsoDep,
+                    mode: nci::MappingConfigurationMode {
+                        poll_mode: nci::FeatureFlag::Enabled,
+                        listen_mode: nci::FeatureFlag::Enabled,
+                    },
+                    rf_interface: nci::RfInterfaceType::IsoDep,
+                },
+                nci::MappingConfiguration {
+                    rf_protocol: nci::RfProtocolType::Ndef,
+                    mode: nci::MappingConfigurationMode {
+                        poll_mode: nci::FeatureFlag::Enabled,
+                        listen_mode: nci::FeatureFlag::Disabled,
+                    },
+                    rf_interface: nci::RfInterfaceType::Ndef,
+                },
+            ],
+        };
+        assert!(controller.rf_discover_map(map_cmd).await.is_ok());
+        assert_eq!(controller.state.discover_map.len(), 2);
+
+        // 2. Set Listen Mode Routing
+        let routing_cmd = nci::RfSetListenModeRoutingCommand {
+            more_to_follow: 0,
+            routing_entries: vec![nci::ListenModeRoutingEntry {
+                r#type: nci::ListenModeRoutingEntryType::ProtocolBasedRouting,
+                match_longer_aids: nci::FeatureFlag::Disabled,
+                match_shorter_aids: nci::FeatureFlag::Disabled,
+                routing_blocked_for_unsupported_power_modes: nci::FeatureFlag::Disabled,
+                value: vec![0x04, 0x00, 0x01],
+            }],
+        };
+        assert!(controller.rf_set_listen_mode_routing(routing_cmd).await.is_ok());
+
+        // 3. Get Listen Mode Routing
+        assert!(controller
+            .rf_listen_mode_routing(nci::RfGetListenModeRoutingCommand {})
+            .await
+            .is_ok());
+
+        // 4. RF Discover
+        let discover_cmd = nci::RfDiscoverCommand {
+            configurations: vec![
+                nci::DiscoverConfiguration {
+                    technology_and_mode: nci::RfTechnologyAndMode::NfcAPassivePollMode,
+                    discovery_frequency: 1,
+                },
+                nci::DiscoverConfiguration {
+                    technology_and_mode: nci::RfTechnologyAndMode::NfcAPassiveListenMode,
+                    discovery_frequency: 1,
+                },
+            ],
+        };
+        assert!(controller.rf_discover(discover_cmd).await.is_ok());
+        assert_eq!(controller.state.rf_state, RfState::Discovery);
+
+        // Add poll responses to test RfDiscoverSelect
+        controller.state.rf_poll_responses.push(RfPollResponse {
+            id: 2,
+            rf_protocol: rf::Protocol::IsoDep,
+            rf_technology: rf::Technology::NfcA,
+            rf_technology_specific_parameters: vec![0x20],
+        });
+        controller.state.rf_state = RfState::WaitForHostSelect;
+
+        // 5. RF Discover Select with valid ID
+        let select_cmd = nci::RfDiscoverSelectCommand {
+            rf_discovery_id: nci::RfDiscoveryId::from_index(0),
+            rf_protocol: nci::RfProtocolType::IsoDep,
+            rf_interface: nci::RfInterfaceType::IsoDep,
+        };
+        assert!(controller.rf_discover_select(select_cmd).await.is_ok());
+        assert_eq!(
+            controller.state.rf_state,
+            RfState::WaitForSelectResponse {
+                id: 2,
+                rf_discovery_id: 0,
+                rf_interface: nci::RfInterfaceType::IsoDep,
+                rf_protocol: rf::Protocol::IsoDep,
+                rf_technology: rf::Technology::NfcA,
+            }
+        );
+
+        // 6. RF Deactivate to Idle
+        let deact_cmd =
+            nci::RfDeactivateCommand { deactivation_type: nci::DeactivationType::IdleMode };
+        assert!(controller.rf_deactivate(deact_cmd).await.is_ok());
+        assert_eq!(controller.state.rf_state, RfState::Idle);
+    }
+
+    #[tokio::test]
+    async fn test_controller_android_observe_mode() {
+        let (_nci_rx_writer, nci_rx_reader) = tokio::io::duplex(4096);
+        let (_nci_tx_reader, nci_tx_writer) = tokio::io::duplex(4096);
+        let (_rf_peer_tx, rf_rx) = mpsc::unbounded_channel();
+        let (rf_tx, _rf_peer_rx) = mpsc::unbounded_channel();
+
+        let mut nci_stream_pin = std::pin::pin!(nci::Reader::new(nci_rx_reader).into_stream());
+        let nci_writer = nci::Writer::new(nci_tx_writer);
+        let mut controller = Controller::new(1, nci_stream_pin.as_mut(), nci_writer, rf_rx, rf_tx);
+
+        // 1. Enable Observe Mode
+        let observe_cmd = nci::AndroidPassiveObserveModeCommand {
+            passive_observe_mode: nci::PassiveObserveMode::try_from(0x01).unwrap(),
+        };
+        assert!(controller.android_passive_observe_mode(observe_cmd).await.is_ok());
+        assert_eq!(controller.state.passive_observe_mode, nci::TechnologyMask::AllOn.into());
+
+        // 2. Query Observe Mode
+        let query_cmd = nci::AndroidQueryPassiveObserveModeCommand {};
+        assert!(controller.android_query_passive_observe_mode(query_cmd).await.is_ok());
+
+        // 3. Disable Observe Mode
+        let disable_cmd = nci::AndroidPassiveObserveModeCommand {
+            passive_observe_mode: nci::PassiveObserveMode::try_from(0x00).unwrap(),
+        };
+        assert!(controller.android_passive_observe_mode(disable_cmd).await.is_ok());
+        assert_eq!(controller.state.passive_observe_mode, nci::TechnologyMask::AllOff.into());
+    }
+
+    #[tokio::test]
+    async fn test_controller_data_packet_and_credits() {
+        let (_nci_rx_writer, nci_rx_reader) = tokio::io::duplex(4096);
+        let (_nci_tx_reader, nci_tx_writer) = tokio::io::duplex(4096);
+        let (_rf_peer_tx, rf_rx) = mpsc::unbounded_channel();
+        let (rf_tx, _rf_peer_rx) = mpsc::unbounded_channel();
+
+        let mut nci_stream_pin = std::pin::pin!(nci::Reader::new(nci_rx_reader).into_stream());
+        let nci_writer = nci::Writer::new(nci_tx_writer);
+        let mut controller = Controller::new(1, nci_stream_pin.as_mut(), nci_writer, rf_rx, rf_tx);
+
+        // Put controller in PollActive state
+        controller.state.rf_state = RfState::PollActive {
+            id: 2,
+            rf_interface: nci::RfInterfaceType::IsoDep,
+            rf_protocol: rf::Protocol::IsoDep,
+            rf_technology: rf::Technology::NfcA,
+        };
+
+        // Send data packet
+        let data = rf::Data {
+            sender: 2,
+            receiver: 1,
+            technology: rf::Technology::NfcA,
+            protocol: rf::Protocol::IsoDep,
+            bitrate: rf::BitRate::BitRate106KbitS,
+            power_level: 255,
+            data: vec![0x00, 0xA4, 0x04, 0x00, 0x07, 0xA0, 0x00, 0x00, 0x04, 0x76, 0x09, 0x00],
+        };
+        assert!(controller.data_packet(data).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_controller_receive_rf_packets() {
+        let (_nci_rx_writer, nci_rx_reader) = tokio::io::duplex(4096);
+        let (_nci_tx_reader, nci_tx_writer) = tokio::io::duplex(4096);
+        let (_rf_peer_tx, rf_rx) = mpsc::unbounded_channel();
+        let (rf_tx, _rf_peer_rx) = mpsc::unbounded_channel();
+
+        let mut nci_stream_pin = std::pin::pin!(nci::Reader::new(nci_rx_reader).into_stream());
+        let nci_writer = nci::Writer::new(nci_tx_writer);
+        let mut controller = Controller::new(1, nci_stream_pin.as_mut(), nci_writer, rf_rx, rf_tx);
+
+        // 1. Controller in PollActive receives PollCommand
+        controller.state.rf_state = RfState::PollActive {
+            id: 2,
+            rf_interface: nci::RfInterfaceType::IsoDep,
+            rf_protocol: rf::Protocol::IsoDep,
+            rf_technology: rf::Technology::NfcA,
+        };
+        let poll_cmd: rf::RfPacket = rf::PollCommand {
+            sender: 2,
+            receiver: u16::MAX,
+            technology: rf::Technology::NfcA,
+            protocol: rf::Protocol::IsoDep,
+            bitrate: rf::BitRate::BitRate106KbitS,
+            power_level: 255,
+            format: rf::PollingFrameFormat::Short,
+            payload: vec![],
+        }
+        .try_into()
+        .unwrap();
+        assert!(controller.receive_rf(poll_cmd).await.is_ok());
+
+        // 2. Controller in Discovery receives PollResponse
+        controller.state.rf_state = RfState::Discovery;
+        controller.state.discover_configuration = vec![nci::DiscoverConfiguration {
+            technology_and_mode: nci::RfTechnologyAndMode::NfcAPassivePollMode,
+            discovery_frequency: 1,
+        }];
+        let poll_resp: rf::RfPacket = rf::NfcAPollResponse {
+            sender: 2,
+            receiver: 1,
+            protocol: rf::Protocol::IsoDep,
+            bitrate: rf::BitRate::BitRate106KbitS,
+            power_level: 255,
+            nfcid1: vec![0x08, 0x01, 0x02, 0x03],
+            int_protocol: 0x01,
+            bit_frame_sdd: 0x08,
+        }
+        .try_into()
+        .unwrap();
+        assert!(controller.receive_rf(poll_resp).await.is_ok());
+        assert_eq!(controller.state.rf_poll_responses.len(), 1);
+
+        // 3. Controller receives IsoDepT4ATSelectResponse in WaitForSelectResponse
+        controller.state.rf_state = RfState::WaitForSelectResponse {
+            id: 2,
+            rf_discovery_id: 0,
+            rf_interface: nci::RfInterfaceType::IsoDep,
+            rf_protocol: rf::Protocol::IsoDep,
+            rf_technology: rf::Technology::NfcA,
+        };
+        let select_resp: rf::RfPacket = rf::IsoDepT4ATSelectResponse {
+            sender: 2,
+            receiver: 1,
+            bitrate: rf::BitRate::BitRate106KbitS,
+            power_level: 255,
+            rats_response: vec![0x05, 0x78, 0x80, 0x71, 0x02],
+        }
+        .try_into()
+        .unwrap();
+        assert!(controller.receive_rf(select_resp).await.is_ok());
+        assert_eq!(
+            controller.state.rf_state,
+            RfState::PollActive {
+                id: 2,
+                rf_interface: nci::RfInterfaceType::IsoDep,
+                rf_protocol: rf::Protocol::IsoDep,
+                rf_technology: rf::Technology::NfcA,
+            }
+        );
+
+        // 4. Inactivity timeout check on PollActive triggers reset to Discovery
+        assert!(controller.state.last_rf_received_time.is_some());
+        controller.state.last_rf_received_time =
+            Some(Instant::now().checked_sub(Duration::from_millis(6000)).unwrap());
+        assert!(controller.tick().await.is_ok());
+        assert_eq!(controller.state.rf_state, RfState::Discovery);
     }
 }

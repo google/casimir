@@ -153,18 +153,26 @@ packet NfcAPollResponse : RfPacket (technology = NFC_A, packet_type = POLL_RESPO
     bit_frame_sdd: 8,
 }
 
+/// TODO(): change naming back to T4ATSelectCommand after the PDL generator is fixed.
+/// Workaround: The PDL rust generator sorts packet specialization match arms alphabetically
+/// rather than by specificity. Because SelectCommand ('S') alphabetically precedes
+/// T4ATSelectCommand ('T'), the generic SelectCommand arm matches first and drops payload bytes.
+/// Prepending 'IsoDep' ('I') ensures this packet is evaluated before SelectCommand ('S').
+///
 /// Select command for an NFC-A Listener using ISO-DEP protocol (Type-4A Tag platform).
 /// Contains information from the RATS Command.
 /// Cf [DIGITAL] 14.6.1 RATS Command.
-packet T4ATSelectCommand : RfPacket (technology = NFC_A, protocol = ISO_DEP, packet_type = SELECT_COMMAND) {
+packet IsoDepT4ATSelectCommand : RfPacket (technology = NFC_A, protocol = ISO_DEP, packet_type = SELECT_COMMAND) {
     // Cf [DIGITAL] Table 55: RATS Parameter Byte (PARAM) Format
     param : 8,
 }
 
+/// TODO(): change naming back to T4ATSelectResponse after the PDL generator is fixed.
+///
 /// Select response for an NFC-A Listener using ISO-DEP protocol (Type-4A Tag platform).
 /// Contains information from the RATS Response.
 /// Cf [DIGITAL] 14.6.2 RATS Response (Answer To Select).
-packet T4ATSelectResponse : RfPacket (technology = NFC_A, protocol = ISO_DEP, packet_type = SELECT_RESPONSE) {
+packet IsoDepT4ATSelectResponse : RfPacket (technology = NFC_A, protocol = ISO_DEP, packet_type = SELECT_RESPONSE) {
     // Cf [DIGITAL] Table 58: RATS Response Format
     // `rats_response` contains all the bytes from the RATS Response, starting
     // from and including Byte 2.
