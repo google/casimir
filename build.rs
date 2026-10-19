@@ -23,6 +23,7 @@ fn main() {
     generate_module(&PathBuf::from("src/nci_packets.pdl").canonicalize().unwrap());
     generate_module(&PathBuf::from("src/rf_packets.pdl").canonicalize().unwrap());
 
+    #[cfg(feature = "grpc")]
     protoc_grpcio::compile_grpc_protos(&["casimir.proto"], &["src/proto"], &"src/proto", None)
         .expect("gRPC generation failed");
 }
