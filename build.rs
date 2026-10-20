@@ -24,8 +24,14 @@ fn main() {
     generate_module(&PathBuf::from("src/rf_packets.pdl").canonicalize().unwrap());
 
     #[cfg(feature = "grpc")]
-    protoc_grpcio::compile_grpc_protos(&["casimir.proto"], &["src/proto"], &"src/proto", None)
-        .expect("gRPC generation failed");
+    {
+        println!("cargo:rerun-if-changed=src/proto/casimir.proto");
+        let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+        protoc_grpcio::compile_grpc_protos(["casimir.proto"], ["src/proto"], &out_dir, None)
+            .expect("gRPC generation failed");
+        std::fs::write(out_dir.join("mod.rs"), "pub mod casimir;\npub mod casimir_grpc;\n")
+            .expect("failed to write generated mod.rs");
+    }
 }
 
 fn generate_module(in_file: &Path) {
