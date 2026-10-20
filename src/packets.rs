@@ -17,6 +17,8 @@
 /// NCI packet parser and serializer.
 pub mod nci {
     #![allow(clippy::all)]
+    #![allow(clippy::pedantic)]
+    #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
     #![allow(unused)]
     #![allow(missing_docs)]
 
@@ -26,7 +28,7 @@ pub mod nci {
         /// Create a Conn ID with `id` as an offset in the range of dynamic
         /// identifiers.
         pub fn from_dynamic(id: u8) -> Self {
-            ConnId::try_from(id as u8 + 2).unwrap()
+            ConnId::try_from(id + 2).expect("valid dynamic ConnId")
         }
 
         /// Return the index for a dynamic Conn ID.
@@ -38,13 +40,13 @@ pub mod nci {
     impl RfDiscoveryId {
         /// Create the default reserved RF Discovery ID.
         pub fn reserved() -> Self {
-            RfDiscoveryId::try_from(0).unwrap()
+            RfDiscoveryId::try_from(0).expect("valid reserved RfDiscoveryId")
         }
 
         /// Create an RF Discovery ID with `id` as an offset in the range of
         /// non-reserved identifiers.
         pub fn from_index(id: usize) -> Self {
-            RfDiscoveryId::try_from(id as u8 + 1).unwrap()
+            RfDiscoveryId::try_from(id as u8 + 1).expect("valid RfDiscoveryId")
         }
 
         /// Return the index for a valid RF Discovery ID.
@@ -55,11 +57,11 @@ pub mod nci {
 
     impl NfceeId {
         pub fn nfcee(id: u8) -> Self {
-            NfceeId::try_from(id).unwrap()
+            NfceeId::try_from(id).expect("valid NfceeId")
         }
 
         pub fn hci_nfcee(id: u8) -> Self {
-            NfceeId::try_from(id).unwrap()
+            NfceeId::try_from(id).expect("valid hci NfceeId")
         }
     }
 
@@ -138,11 +140,13 @@ pub mod nci {
 
         /// Write a single NCI packet to the writer. The packet is automatically
         /// segmented if the payload exceeds the maximum size limit.
-        pub async fn write(&mut self, mut packet: &[u8]) -> anyhow::Result<()> {
+        pub async fn write(&mut self, packet: &[u8]) -> anyhow::Result<()> {
             use tokio::io::AsyncWriteExt;
 
-            let mut header_bytes = [packet[0], packet[1], 0];
-            packet = &packet[3..];
+            let Some((&[mt_gid, oid, _], mut packet)) = packet.split_first_chunk::<3>() else {
+                anyhow::bail!("NCI packet shorter than 3-byte header");
+            };
+            let mut header_bytes = [mt_gid, oid, 0];
 
             loop {
                 // Update header with framing information.
@@ -157,10 +161,12 @@ pub mod nci {
                 header_bytes[0] |= (pbf as u8) << 4;
                 header_bytes[2] = chunk_length as u8;
 
+                let (chunk, rest) = packet.split_at(chunk_length);
+
                 // Write the header and payload segment bytes.
                 self.socket.write_all(&header_bytes).await?;
-                self.socket.write_all(&packet[..chunk_length]).await?;
-                packet = &packet[chunk_length..];
+                self.socket.write_all(chunk).await?;
+                packet = rest;
 
                 if packet.is_empty() {
                     return Ok(());
@@ -173,6 +179,8 @@ pub mod nci {
 /// RF packet parser and serializer.
 pub mod rf {
     #![allow(clippy::all)]
+    #![allow(clippy::pedantic)]
+    #![allow(clippy::indexing_slicing, clippy::unwrap_used)]
     #![allow(unused)]
     #![allow(missing_docs)]
 

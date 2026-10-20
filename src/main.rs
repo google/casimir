@@ -14,6 +14,16 @@
 
 //! NFCC and RF emulator.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::unwrap_used
+    )
+)]
+
 use anyhow::Result;
 use argh::FromArgs;
 use casimir::{Device, Scene};
@@ -138,6 +148,7 @@ async fn run() -> Result<()> {
     }
 }
 
+#[allow(unsafe_code)]
 fn main() -> Result<()> {
     // Safety: First function call in the `main` function, before any other library calls
     unsafe { init_inherited_fds()? };

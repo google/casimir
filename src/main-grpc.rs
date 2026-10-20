@@ -14,9 +14,20 @@
 
 //! NFCC and RF emulator.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::unwrap_used
+    )
+)]
+
 use anyhow::Result;
 use argh::FromArgs;
 use log::{error, info, warn};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -51,7 +62,7 @@ struct Scene {
     next_id: u16,
     waker: Option<std::task::Waker>,
     devices: [Option<CasimirDevice>; MAX_DEVICES],
-    context: std::sync::Arc<std::sync::Mutex<HashMap<Id, DeviceInformation>>>,
+    context: std::sync::Arc<Mutex<HashMap<Id, DeviceInformation>>>,
 }
 
 impl Scene {
@@ -61,7 +72,7 @@ impl Scene {
             next_id: 0,
             waker: None,
             devices: [NONE; MAX_DEVICES],
-            context: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            context: std::sync::Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -72,10 +83,10 @@ impl Scene {
     }
 
     fn add_device(&mut self, builder: impl FnOnce(Id) -> CasimirDevice) -> Result<Id> {
-        for n in 0..MAX_DEVICES {
-            if self.devices[n].is_none() {
+        for slot in self.devices.iter_mut() {
+            if slot.is_none() {
                 let id = self.next_id;
-                self.devices[n] = Some(builder(id));
+                *slot = Some(builder(id));
                 self.next_id += 1;
                 self.wake();
                 return Ok(id);
@@ -85,12 +96,11 @@ impl Scene {
     }
 
     fn disconnect(&mut self, n: usize) {
-        let id = self.devices[n].as_ref().unwrap().id;
-        self.devices[n] = None;
-        self.context.lock().unwrap().remove(&id);
-        for other_n in 0..MAX_DEVICES {
-            let Some(ref device) = self.devices[other_n] else { continue };
-            assert!(n != other_n);
+        let Some(id) = self.devices.get_mut(n).and_then(Option::take).map(|d| d.id) else {
+            return;
+        };
+        self.context.lock().remove(&id);
+        for device in self.devices.iter().flatten() {
             device
                 .rf_tx
                 .send(
@@ -107,14 +117,13 @@ impl Scene {
                     .try_into()
                     .expect("failed to serialize notification"),
                 )
-                .expect("failed to send deactive notification")
+                .expect("failed to send deactive notification");
         }
     }
 
     fn send(&self, packet: &rf::RfPacket) -> Result<()> {
-        let context = self.context.lock().unwrap();
-        for n in 0..MAX_DEVICES {
-            let Some(ref device) = self.devices[n] else { continue };
+        let context = self.context.lock();
+        for device in self.devices.iter().flatten() {
             if packet.sender() != device.id
                 && (packet.receiver() == u16::MAX || packet.receiver() == device.id)
                 && context.get(&device.id).map(|info| info.position)
@@ -133,11 +142,14 @@ impl Future for Scene {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
         for n in 0..MAX_DEVICES {
-            let dropped = match self.devices[n] {
-                Some(ref mut device) => match device.task.as_mut().poll(cx) {
-                    Poll::Ready(Ok(_)) => unreachable!(),
+            let dropped = match self.devices.get_mut(n).and_then(Option::as_mut) {
+                Some(device) => match device.task.as_mut().poll(cx) {
+                    Poll::Ready(Ok(())) => {
+                        warn!("device {n} task finished unexpectedly");
+                        true
+                    }
                     Poll::Ready(Err(err)) => {
-                        warn!("dropping device {}: {}", n, err);
+                        warn!("dropping device {n}: {err}");
                         true
                     }
                     Poll::Pending => false,
@@ -155,13 +167,13 @@ impl Future for Scene {
 
 #[derive(Clone)]
 struct Service {
-    context: std::sync::Arc<std::sync::Mutex<HashMap<Id, DeviceInformation>>>,
+    context: std::sync::Arc<Mutex<HashMap<Id, DeviceInformation>>>,
 }
 
 impl From<&DeviceInformation> for casimir::Device {
     fn from(info: &DeviceInformation) -> Self {
         let mut device = casimir::Device::new();
-        device.set_device_id(info.id as u32);
+        device.set_device_id(u32::from(info.id));
         device.set_position(info.position);
         match info.r#type {
             DeviceType::Nci => device.set_nci(Default::default()),
@@ -180,13 +192,7 @@ impl casimir_grpc::Casimir for Service {
     ) {
         let mut response = casimir::ListDevicesResponse::new();
         response.set_device(
-            self.context
-                .lock()
-                .unwrap()
-                .values()
-                .map(casimir::Device::from)
-                .collect::<Vec<_>>()
-                .into(),
+            self.context.lock().values().map(casimir::Device::from).collect::<Vec<_>>().into(),
         );
         sink.success(response);
     }
@@ -197,7 +203,7 @@ impl casimir_grpc::Casimir for Service {
         req: casimir::GetDeviceRequest,
         sink: grpcio::UnarySink<casimir::GetDeviceResponse>,
     ) {
-        match self.context.lock().unwrap().get(&(req.get_device_id() as u16)) {
+        match self.context.lock().get(&(req.get_device_id() as u16)) {
             Some(info) => {
                 let mut response = casimir::GetDeviceResponse::new();
                 response.set_device(info.into());
@@ -216,7 +222,7 @@ impl casimir_grpc::Casimir for Service {
         req: casimir::MoveDeviceRequest,
         sink: grpcio::UnarySink<casimir::MoveDeviceResponse>,
     ) {
-        match self.context.lock().unwrap().get_mut(&(req.get_device_id() as u16)) {
+        match self.context.lock().get_mut(&(req.get_device_id() as u16)) {
             Some(info) => {
                 info.position = req.get_position();
                 sink.success(Default::default())
@@ -268,44 +274,41 @@ async fn run() -> Result<()> {
     let mut server = grpcio::ServerBuilder::new(env)
         .register_service(service)
         .channel_args(channel_builder.build_args())
-        .build()
-        .unwrap();
-    server
-        .add_listening_port(
-            format!("127.0.0.1:{}", opt.grpc_port),
-            grpcio::ServerCredentials::insecure(),
-        )
-        .unwrap();
+        .build()?;
+    server.add_listening_port(
+        format!("127.0.0.1:{}", opt.grpc_port),
+        grpcio::ServerCredentials::insecure(),
+    )?;
     server.start();
 
     loop {
         select! {
             result = nci_listener.accept() => {
                 let (socket, addr) = result?;
-                info!("Incoming NCI connection from {}", addr);
+                info!("Incoming NCI connection from {addr}");
                 let (socket_rx, socket_tx) = socket.into_split();
                 match scene.add_device(|id| CasimirDevice::nci(id, socket_rx, socket_tx, rf_tx.clone())) {
                     Ok(id) => {
-                        scene.context.lock().unwrap().insert(id, DeviceInformation {
-                            id, position: id as u32, r#type: DeviceType::Nci
+                        scene.context.lock().insert(id, DeviceInformation {
+                            id, position: u32::from(id), r#type: DeviceType::Nci
                         });
-                        info!("Accepted NCI connection from {} with id {}", addr, id)
+                        info!("Accepted NCI connection from {addr} with id {id}")
                     }
-                    Err(err) => error!("Failed to accept NCI connection from {}: {}", addr, err)
+                    Err(err) => error!("Failed to accept NCI connection from {addr}: {err}")
                 }
             },
             result = rf_listener.accept() => {
                 let (socket, addr) = result?;
-                info!("Incoming RF connection from {}", addr);
+                info!("Incoming RF connection from {addr}");
                 let (socket_rx, socket_tx) = socket.into_split();
                 match scene.add_device(|id| CasimirDevice::rf(id, socket_rx, socket_tx, rf_tx.clone())) {
                     Ok(id) => {
-                        scene.context.lock().unwrap().insert(id, DeviceInformation {
-                            id, position: id as u32, r#type: DeviceType::Rf
+                        scene.context.lock().insert(id, DeviceInformation {
+                            id, position: u32::from(id), r#type: DeviceType::Rf
                         });
-                        info!("Accepted RF connection from {} with id {}", addr, id)
+                        info!("Accepted RF connection from {addr} with id {id}")
                     }
-                    Err(err) => error!("Failed to accept RF connection from {}: {}", addr, err)
+                    Err(err) => error!("Failed to accept RF connection from {addr}: {err}")
                 }
             },
             _ = &mut scene => (),
