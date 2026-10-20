@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// @generated
+#![allow(warnings, clippy::all, clippy::pedantic, clippy::restriction, clippy::nursery)]
 
-pub mod casimir;
-pub mod casimir_grpc;
+include!(concat!(env!("OUT_DIR"), "/mod.rs"));
