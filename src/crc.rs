@@ -33,7 +33,7 @@ fn crc16(data: &[u8], initial: u16, invert: bool) -> (u8, u8) {
     let mut w_crc: u16 = initial;
 
     for &byte in data {
-        let mut temp: u16 = (byte as u16) ^ (w_crc & 0x00FF);
+        let mut temp: u16 = u16::from(byte) ^ (w_crc & 0x00FF);
         temp = (temp ^ (temp << 4)) & 0xFF;
         w_crc = (w_crc >> 8) ^ (temp << 8) ^ (temp << 3) ^ (temp >> 4);
     }
@@ -60,17 +60,20 @@ fn crc16b(data: &[u8]) -> (u8, u8) {
 
 /// Verify CRC is valid for provided NFC technology
 pub fn verify_crc(technology: rf::Technology, data: &[u8]) -> Result<(), CrcVerificationError> {
-    if data.len() <= 2 {
+    let [payload @ .., expected_lo, expected_hi] = data else {
+        return Err(CrcVerificationError::InvalidInputLength);
+    };
+    if payload.is_empty() {
         return Err(CrcVerificationError::InvalidInputLength);
     }
 
     let (crc_lo, crc_hi) = match technology {
-        rf::Technology::NfcA => crc16a(&data[..data.len() - 2]),
-        rf::Technology::NfcB => crc16b(&data[..data.len() - 2]),
+        rf::Technology::NfcA => crc16a(payload),
+        rf::Technology::NfcB => crc16b(payload),
         _ => return Err(CrcVerificationError::UnsupportedTechnology),
     };
 
-    if crc_lo == data[data.len() - 2] && crc_hi == data[data.len() - 1] {
+    if crc_lo == *expected_lo && crc_hi == *expected_hi {
         Ok(())
     } else {
         Err(CrcVerificationError::VerificationFailed)

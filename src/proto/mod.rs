@@ -12,6 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(warnings, clippy::all, clippy::pedantic, clippy::restriction, clippy::nursery)]
+#![allow(
+    missing_docs,
+    trivial_casts,
+    trivial_numeric_casts,
+    unsafe_code,
+    unused_qualifications,
+    unused_results,
+    variant_size_differences,
+    warnings,
+    clippy::all,
+    clippy::pedantic,
+    clippy::restriction,
+    clippy::nursery
+)]
 
 include!(concat!(env!("OUT_DIR"), "/mod.rs"));

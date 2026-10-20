@@ -14,6 +14,16 @@
 
 //! Casimir NFC Simulator Library.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::unwrap_used
+    )
+)]
+
 use anyhow::Result;
 use log::warn;
 use pdl_runtime::Packet;
@@ -61,7 +71,7 @@ impl RfReader {
         let mut header_bytes = [0; HEADER_SIZE];
 
         // Read the header bytes.
-        self.socket.read_exact(&mut header_bytes[0..HEADER_SIZE]).await?;
+        self.socket.read_exact(&mut header_bytes).await?;
         let packet_length = u16::from_le_bytes(header_bytes) as usize;
 
         // Read the packet data.
@@ -157,7 +167,10 @@ impl Device {
                             // modifying the parsed fields so the change needs to be
                             // applied to the unparsed packet.
                             let mut packet_bytes = rf_reader.read().await?;
-                            packet_bytes[0..2].copy_from_slice(&id.to_le_bytes());
+                            let Some(sender_bytes) = packet_bytes.first_chunk_mut::<2>() else {
+                                anyhow::bail!("RF packet shorter than 2-byte sender header");
+                            };
+                            *sender_bytes = id.to_le_bytes();
 
                             // Parse the input packet.
                             let (packet, _) = rf::RfPacket::decode(&packet_bytes)?;
@@ -221,9 +234,9 @@ impl Scene {
         &mut self,
         builder: impl FnOnce(Id, mpsc::UnboundedSender<rf::RfPacket>) -> Device,
     ) -> Result<Id> {
-        for n in 0..MAX_DEVICES {
-            if self.devices[n].is_none() {
-                self.devices[n] = Some(builder(self.next_id, self.rf_tx.clone()));
+        for (n, slot) in self.devices.iter_mut().enumerate() {
+            if slot.is_none() {
+                *slot = Some(builder(self.next_id, self.rf_tx.clone()));
                 self.next_id += 1;
                 self.wake();
                 return Ok(n as Id);
@@ -234,11 +247,10 @@ impl Scene {
 
     /// Disconnect a device from the scene.
     pub fn disconnect(&mut self, n: usize) {
-        let id = self.devices[n].as_ref().unwrap().id;
-        self.devices[n] = None;
-        for other_n in 0..MAX_DEVICES {
-            let Some(ref device) = self.devices[other_n] else { continue };
-            assert!(n != other_n);
+        let Some(id) = self.devices.get_mut(n).and_then(Option::take).map(|d| d.id) else {
+            return;
+        };
+        for device in self.devices.iter().flatten() {
             device
                 .rf_tx
                 .send(
@@ -255,14 +267,13 @@ impl Scene {
                     .try_into()
                     .expect("failed to serialize notification"),
                 )
-                .expect("failed to send deactive notification")
+                .expect("failed to send deactive notification");
         }
     }
 
     /// Send a packet to all other devices in the scene.
     fn send(&self, packet: &rf::RfPacket) -> Result<()> {
-        for n in 0..MAX_DEVICES {
-            let Some(ref device) = self.devices[n] else { continue };
+        for device in self.devices.iter().flatten() {
             if packet.sender() != device.id
                 && (packet.receiver() == u16::MAX || packet.receiver() == device.id)
             {
@@ -288,9 +299,12 @@ impl Future for Scene {
         }
 
         for n in 0..MAX_DEVICES {
-            let dropped = match self.devices[n] {
-                Some(ref mut device) => match device.task.as_mut().poll(cx) {
-                    Poll::Ready(Ok(_)) => unreachable!(),
+            let dropped = match self.devices.get_mut(n).and_then(Option::as_mut) {
+                Some(device) => match device.task.as_mut().poll(cx) {
+                    Poll::Ready(Ok(())) => {
+                        warn!("device {n} task finished unexpectedly");
+                        true
+                    }
                     Poll::Ready(Err(err)) => {
                         warn!("dropping device {n}: {err}");
                         true
