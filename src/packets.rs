@@ -70,8 +70,8 @@ pub mod nci {
     use tokio::io::{AsyncRead, AsyncWrite};
     use tokio::sync::Mutex;
 
-    /// Read NCI Control and Data packets received on the NCI transport.
-    /// Performs recombination of the segmented packets.
+    /// Read NCI Control and Data packet segments received on the NCI
+    /// transport.
     pub struct Reader {
         socket: Pin<Box<dyn AsyncRead + Send>>,
     }
@@ -88,38 +88,30 @@ pub mod nci {
             Reader { socket: Box::pin(rx) }
         }
 
-        /// Read a single NCI packet from the reader. The packet is automatically
-        /// re-assembled if segmented on the NCI transport.
+        /// Read a single NCI packet segment (header and payload) from the
+        /// reader. Segmented packets are not re-assembled: the receiver needs
+        /// to see each segment of a Data Message to grant credits to the
+        /// sender, which waits for them before sending the next segment.
         pub async fn read(&mut self) -> anyhow::Result<Vec<u8>> {
             use tokio::io::AsyncReadExt;
 
             const HEADER_SIZE: usize = 3;
-            let mut complete_packet = vec![0; HEADER_SIZE];
+            let mut header_bytes = [0; HEADER_SIZE];
 
-            // Note on reassembly:
-            // - for each segment of a Control Message, the header of the
-            //   Control Packet SHALL contain the same MT, GID and OID values,
-            // - for each segment of a Data Message the header of the Data
-            //   Packet SHALL contain the same MT and Conn ID.
-            // Thus it is correct to keep only the last header of the segmented
-            // packet.
-            loop {
-                // Read the common packet header.
-                self.socket.read_exact(&mut complete_packet[0..HEADER_SIZE]).await?;
-                let header = PacketHeader::decode_full(&complete_packet[0..HEADER_SIZE])?;
+            // Read the common packet header.
+            self.socket.read_exact(&mut header_bytes).await?;
+            let header = PacketHeader::decode_full(&header_bytes)?;
 
-                // Read the packet payload.
-                let payload_length = header.payload_length() as usize;
-                let mut payload_bytes = vec![0; payload_length];
-                self.socket.read_exact(&mut payload_bytes).await?;
-                complete_packet.extend(payload_bytes);
+            // Read the packet payload.
+            let payload_length = usize::from(header.payload_length());
+            let mut payload_bytes = vec![0; payload_length];
+            self.socket.read_exact(&mut payload_bytes).await?;
 
-                // Check the Packet Boundary Flag.
-                match header.pbf() {
-                    PacketBoundaryFlag::CompleteOrFinal => return Ok(complete_packet),
-                    PacketBoundaryFlag::Incomplete => (),
-                }
-            }
+            let mut segment = Vec::with_capacity(HEADER_SIZE + payload_length);
+            segment.extend_from_slice(&header_bytes);
+            segment.extend_from_slice(&payload_bytes);
+
+            Ok(segment)
         }
 
         pub fn into_stream(self) -> impl Stream<Item = anyhow::Result<Vec<u8>>> + Send {
