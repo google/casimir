@@ -247,6 +247,12 @@ pub struct State {
     pub exit_frame_timeout: Duration,
     pub exit_frame_start_time: Option<std::time::Instant>,
     pub exit_frames: Vec<RfExitFrame>,
+    /// Payload of the segments received so far for an incomplete
+    /// Control Message.
+    pub command_segments: Vec<u8>,
+    /// Payload of the segments received so far for an incomplete
+    /// Data Message, indexed by Conn ID.
+    pub data_segments: [Vec<u8>; 16],
 }
 
 /// State of an NFCC instance.
@@ -666,7 +672,44 @@ impl Default for ConfigParameters {
     }
 }
 
+/// Append the payload of an NCI packet segment to `segments`.
+/// Returns the reassembled packet if the segment is the last segment, or `None`
+/// if more segments are expected.
+///
+/// The header of the reassembled packet is `header` (the header of the last
+/// segment): all segments of a message have the same MT and GID, OID or Conn ID.
+fn reassemble(
+    segments: &mut Vec<u8>,
+    header: &[u8; 3],
+    payload: &[u8],
+    pbf: nci::PacketBoundaryFlag,
+) -> Option<Vec<u8>> {
+    segments.extend_from_slice(payload);
+    match pbf {
+        nci::PacketBoundaryFlag::Incomplete => None,
+        nci::PacketBoundaryFlag::CompleteOrFinal => {
+            let mut packet = Vec::with_capacity(header.len() + segments.len());
+            packet.extend_from_slice(header);
+            packet.append(segments);
+            Some(packet)
+        }
+    }
+}
+
 impl State {
+    /// Segments received so far for an incomplete Data Message on the
+    /// selected Logical Connection.
+    fn data_segments(&mut self, conn_id: nci::ConnId) -> Option<&mut Vec<u8>> {
+        self.data_segments.get_mut(usize::from(u8::from(conn_id)))
+    }
+
+    /// Clear any buffered incomplete Data Message segments for `conn_id`.
+    fn clear_data_segments(&mut self, conn_id: nci::ConnId) {
+        if let Some(segments) = self.data_segments(conn_id) {
+            segments.clear();
+        }
+    }
+
     /// Craft the NFCID1 used by this instance in NFC-A poll responses.
     /// Returns a dynamically generated NFCID1 (4 byte long and starts with 08h).
     fn nfcid1(&self) -> Vec<u8> {
@@ -761,6 +804,8 @@ impl<'a> Controller<'a> {
                 exit_frame_timeout: Duration::from_millis(0),
                 exit_frame_start_time: None,
                 exit_frames: vec![],
+                command_segments: vec![],
+                data_segments: Default::default(),
             },
         }
     }
@@ -799,6 +844,9 @@ impl<'a> Controller<'a> {
         self.state.discover_configuration.clear();
         self.state.rf_state = RfState::Idle;
         self.state.rf_poll_responses.clear();
+        for segments in &mut self.state.data_segments {
+            segments.clear();
+        }
 
         self.send_control(nci::CoreResetResponse { status: nci::Status::Ok }).await?;
 
@@ -1068,6 +1116,10 @@ impl<'a> Controller<'a> {
             }
         };
 
+        if status == nci::Status::Ok {
+            self.state.clear_data_segments(cmd.conn_id());
+        }
+
         self.send_control(nci::CoreConnCloseResponse { status }).await?;
 
         Ok(())
@@ -1247,6 +1299,7 @@ impl<'a> Controller<'a> {
         // Update the state now to prevent interface activation from
         // completing if a remote device is being selected.
         (next_state, self.state.rf_state) = (self.state.rf_state, next_state);
+        self.state.clear_data_segments(nci::ConnId::StaticRf);
 
         self.send_control(nci::RfDeactivateResponse { status }).await?;
 
@@ -2030,6 +2083,7 @@ impl<'a> Controller<'a> {
             rf_interface: nci::RfInterfaceType::IsoDep,
         };
         self.state.last_rf_received_time = Some(Instant::now());
+        self.state.clear_data_segments(nci::ConnId::StaticRf);
 
         // [DIGITAL] 14.6.2 RATS Response (Answer To Select)
         // Construct the response from the values passed in the configuration
@@ -2107,6 +2161,7 @@ impl<'a> Controller<'a> {
             rf_interface,
         };
         self.state.last_rf_received_time = Some(Instant::now());
+        self.state.clear_data_segments(nci::ConnId::StaticRf);
 
         // Save the activation parameters for the RF frame interface
         // implementation. Note: TL is not included in the RATS response
@@ -2262,6 +2317,7 @@ impl<'a> Controller<'a> {
 
         // Deactivate the active RF interface if applicable.
         if next_state != self.state.rf_state {
+            self.state.clear_data_segments(nci::ConnId::StaticRf);
             self.field_info(rf::FieldStatus::FieldOff, 255).await?;
             self.send_control(nci::RfDeactivateNotification {
                 deactivation_type: cmd.type_().into(),
@@ -2379,6 +2435,86 @@ impl<'a> Controller<'a> {
         Ok(())
     }
 
+    /// Handle one NCI packet segment received from the DH. Segmented messages
+    /// are reassembled here, separately for Control Messages and for each
+    /// Logical Connection, as the DH can send a Control Message between two
+    /// segments of a Data Message.
+    async fn receive_nci(&mut self, segment: &[u8]) -> Result<()> {
+        let Some((header_bytes, payload)) = segment.split_first_chunk::<3>() else {
+            warn!("[{}] NCI packet shorter than header", self.id);
+            return Ok(());
+        };
+        let header = match nci::PacketHeader::decode_full(header_bytes) {
+            Ok(h) => h,
+            Err(err) => {
+                warn!("[{}] failed to decode NCI packet header: {err}", self.id);
+                return Ok(());
+            }
+        };
+        match header.mt() {
+            nci::MessageType::Data => {
+                let conn_id = match nci::DataPacket::decode(segment) {
+                    Ok((p, _)) => p.conn_id(),
+                    Err(err) => {
+                        warn!("[{}] failed to decode NCI data packet: {err}", self.id);
+                        return Ok(());
+                    }
+                };
+                let Some(segments) = self.state.data_segments(conn_id) else {
+                    warn!("[{}] invalid NCI data packet conn_id: {conn_id:?}", self.id);
+                    return Ok(());
+                };
+                let Some(packet) = reassemble(segments, header_bytes, payload, header.pbf()) else {
+                    return self.incomplete_data(conn_id).await;
+                };
+                match nci::DataPacket::decode(&packet) {
+                    Ok((p, _)) => self.receive_data(p).await?,
+                    Err(err) => warn!("[{}] failed to decode NCI data packet: {err}", self.id),
+                }
+            }
+            nci::MessageType::Command => {
+                let segments = &mut self.state.command_segments;
+                let Some(packet) = reassemble(segments, header_bytes, payload, header.pbf()) else {
+                    return Ok(());
+                };
+                match nci::ControlPacket::decode(&packet) {
+                    Ok((p, _)) => self.receive_command(p).await?,
+                    Err(err) => warn!("[{}] failed to decode NCI command packet: {err}", self.id),
+                }
+            }
+            mt => {
+                warn!("[{}] unexpected message type {:?} in received NCI packet", self.id, mt);
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle a segment of a Data Message that is not the last one.
+    ///
+    /// [NCI] 4.4.4 Credits are counted in Data Packets, not in Data Messages:
+    /// the DH spends one credit for each segment, and with a single credit
+    /// it cannot send the next segment until that credit is given back.
+    /// The credit for the last segment is given back when the complete
+    /// message is processed (see rf_conn_data).
+    async fn incomplete_data(&mut self, conn_id: nci::ConnId) -> Result<()> {
+        // Flow control is only enabled on the static RF connection, while an
+        // RF interface is activated.
+        let rf_active = matches!(
+            self.state.rf_state,
+            RfState::PollActive { .. } | RfState::ListenActive { .. }
+        );
+        if !matches!(conn_id, nci::ConnId::StaticRf) || !rf_active {
+            return Ok(());
+        }
+        self.send_control(nci::CoreConnCreditsNotification {
+            connections: vec![nci::ConnectionCredits {
+                conn_id: nci::ConnId::StaticRf,
+                credits: 1,
+            }],
+        })
+        .await
+    }
+
     async fn run_until<O>(&mut self, future: impl Future<Output = O>) -> Result<O> {
         let mut future = pin!(future);
         loop {
@@ -2392,34 +2528,7 @@ impl<'a> Controller<'a> {
                         }
                         None => return Err(anyhow::anyhow!("nci channel closed")),
                     };
-                    let Some(header_bytes) = packet.get(..3) else {
-                        warn!("[{}] NCI packet shorter than header", self.id);
-                        continue;
-                    };
-                    let header = match nci::PacketHeader::decode_full(header_bytes) {
-                        Ok(h) => h,
-                        Err(err) => {
-                            warn!("[{}] failed to decode NCI packet header: {err}", self.id);
-                            continue;
-                        }
-                    };
-                    match header.mt() {
-                        nci::MessageType::Data => {
-                            match nci::DataPacket::decode(&packet) {
-                                Ok((p, _)) => self.receive_data(p).await?,
-                                Err(err) => warn!("[{}] failed to decode NCI data packet: {err}", self.id),
-                            }
-                        }
-                        nci::MessageType::Command => {
-                            match nci::ControlPacket::decode(&packet) {
-                                Ok((p, _)) => self.receive_command(p).await?,
-                                Err(err) => warn!("[{}] failed to decode NCI command packet: {err}", self.id),
-                            }
-                        }
-                        mt => {
-                            warn!("[{}] unexpected message type {:?} in received NCI packet", self.id, mt);
-                        }
-                    }
+                    self.receive_nci(&packet).await?
                 },
                 rf_packet = self.rf_rx.recv() => {
                     self.receive_rf(
@@ -2447,6 +2556,7 @@ impl<'a> Controller<'a> {
                     | RfState::WaitForSelectResponse { .. } => {
                         self.state.rf_state = RfState::Discovery;
                         self.state.last_rf_received_time = None;
+                        self.state.clear_data_segments(nci::ConnId::StaticRf);
                         self.send_control(nci::RfDeactivateNotification {
                             deactivation_type: nci::DeactivationType::Discovery,
                             deactivation_reason: nci::DeactivationReason::RfLinkLoss,
@@ -2635,6 +2745,8 @@ mod tests {
             exit_frame_timeout: Duration::from_millis(0),
             exit_frame_start_time: None,
             exit_frames: vec![],
+            command_segments: vec![],
+            data_segments: Default::default(),
         }
     }
 
@@ -3303,5 +3415,295 @@ mod tests {
             Some(Instant::now().checked_sub(Duration::from_millis(6000)).unwrap());
         assert!(controller.tick().await.is_ok());
         assert_eq!(controller.state.rf_state, RfState::Discovery);
+    }
+
+    // NCI segmentation and credit based flow control.
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    /// Bound on each test scenario, so that a credit deadlock fails the test
+    /// instead of hanging it.
+    const TIMEOUT: Duration = Duration::from_secs(2);
+    const NFCC_ID: u16 = 1;
+    const PEER_ID: u16 = 2;
+
+    const INCOMPLETE: u8 = 0x10;
+    const FINAL: u8 = 0x00;
+
+    /// CORE_CONN_CREDITS_NTF granting one credit to the static RF connection.
+    const RF_CREDIT: [u8; 6] = [0x60, 0x06, 0x03, 0x01, 0x00, 0x01];
+    /// CORE_GET_CONFIG_CMD for TOTAL_DURATION and PA_BAIL_OUT, as one segment
+    /// and split in two segments.
+    const GET_CONFIG: [u8; 6] = [0x20, 0x03, 0x03, 0x02, 0x00, 0x08];
+    const GET_CONFIG_SEGMENT_1: [u8; 5] = [0x30, 0x03, 0x02, 0x02, 0x00];
+    const GET_CONFIG_SEGMENT_2: [u8; 4] = [0x20, 0x03, 0x01, 0x08];
+
+    const ISO_DEP_POLL: RfState = RfState::PollActive {
+        id: PEER_ID,
+        rf_interface: nci::RfInterfaceType::IsoDep,
+        rf_technology: rf::Technology::NfcA,
+        rf_protocol: rf::Protocol::IsoDep,
+    };
+    const ISO_DEP_LISTEN: RfState = RfState::ListenActive {
+        id: PEER_ID,
+        rf_interface: nci::RfInterfaceType::IsoDep,
+        rf_technology: rf::Technology::NfcA,
+        rf_protocol: rf::Protocol::IsoDep,
+    };
+
+    /// The Device Host and the remote RF endpoint connected to the tested
+    /// controller.
+    struct Peers {
+        nci_tx: DuplexStream,
+        nci_rx: DuplexStream,
+        rf_tx: mpsc::UnboundedSender<rf::RfPacket>,
+        rf_rx: mpsc::UnboundedReceiver<rf::RfPacket>,
+    }
+
+    /// Create a controller connected to the returned peers.
+    fn setup() -> (Peers, Controller<'static>) {
+        let (host_nci_tx, nfcc_nci_rx) = tokio::io::duplex(4096);
+        let (nfcc_nci_tx, host_nci_rx) = tokio::io::duplex(4096);
+        let (peer_rf_tx, nfcc_rf_rx) = mpsc::unbounded_channel();
+        let (nfcc_rf_tx, peer_rf_rx) = mpsc::unbounded_channel();
+        // The controller borrows the NCI stream; leak it to keep the setup
+        // in one function.
+        let nci_stream = Box::leak(Box::new(Box::pin(nci::Reader::new(nfcc_nci_rx).into_stream())));
+        let nfcc = Controller::new(
+            NFCC_ID,
+            nci_stream.as_mut(),
+            nci::Writer::new(nfcc_nci_tx),
+            nfcc_rf_rx,
+            nfcc_rf_tx,
+        );
+        let peers = Peers {
+            nci_tx: host_nci_tx,
+            nci_rx: host_nci_rx,
+            rf_tx: peer_rf_tx,
+            rf_rx: peer_rf_rx,
+        };
+        (peers, nfcc)
+    }
+
+    impl Peers {
+        /// Write raw bytes to the NCI transport of the controller.
+        async fn write_nci(&mut self, bytes: &[u8]) {
+            self.nci_tx.write_all(bytes).await.unwrap();
+        }
+
+        /// Write one segment of a data packet on the static RF connection.
+        async fn write_rf_data(&mut self, pbf: u8, payload: &[u8]) {
+            self.write_nci(&[pbf, 0x00, payload.len() as u8]).await;
+            self.write_nci(payload).await;
+        }
+
+        /// Read one packet segment from the NCI transport of the controller.
+        async fn read_nci(&mut self) -> Vec<u8> {
+            let mut segment = vec![0; 3];
+            self.nci_rx.read_exact(&mut segment).await.unwrap();
+            let mut payload = vec![0; usize::from(segment[2])];
+            self.nci_rx.read_exact(&mut payload).await.unwrap();
+            segment.extend(payload);
+            segment
+        }
+
+        /// Send a control command, and check that the response is the next
+        /// packet sent by the controller.
+        async fn get_config(&mut self) -> Vec<u8> {
+            self.write_nci(&GET_CONFIG).await;
+            let response = self.read_nci().await;
+            assert_eq!(response[..2], [0x40, 0x03], "expected CORE_GET_CONFIG_RSP");
+            response
+        }
+
+        /// Read the payload of the next data packet sent to the RF endpoint.
+        async fn read_rf_data(&mut self) -> Vec<u8> {
+            match self.rf_rx.recv().await.unwrap().specialize().unwrap() {
+                rf::RfPacketChild::Data(data) => {
+                    assert_eq!(data.sender(), NFCC_ID);
+                    assert_eq!(data.receiver(), PEER_ID);
+                    data.data().to_vec()
+                }
+                packet => panic!("unexpected RF packet {packet:?}"),
+            }
+        }
+
+        fn assert_no_rf_packet(&mut self) {
+            assert_eq!(self.rf_rx.try_recv().err(), Some(TryRecvError::Empty));
+        }
+
+        /// Select the controller as an ISO-DEP listener.
+        async fn activate_listen(&mut self) {
+            let select: rf::RfPacket = rf::IsoDepT4ATSelectCommand {
+                sender: PEER_ID,
+                receiver: NFCC_ID,
+                bitrate: rf::BitRate::BitRate106KbitS,
+                power_level: 255,
+                param: 0x80,
+            }
+            .try_into()
+            .unwrap();
+            self.rf_tx.send(select).unwrap();
+            let activated = self.read_nci().await;
+            assert_eq!(activated[..2], [0x61, 0x05], "expected RF_INTF_ACTIVATED_NTF");
+            assert_eq!(activated[8], 1, "initial number of credits");
+            assert!(matches!(
+                self.rf_rx.recv().await.unwrap().specialize().unwrap(),
+                rf::RfPacketChild::IsoDepT4ATSelectResponse(_)
+            ));
+        }
+    }
+
+    /// Run the controller until the test scenario completes.
+    async fn run(nfcc: &mut Controller<'_>, scenario: impl Future<Output = ()>) {
+        nfcc.run_until(time::timeout(TIMEOUT, scenario))
+            .await
+            .unwrap()
+            .expect("timeout: the controller did not send the expected packets");
+    }
+
+    /// Send a data packet split in `segment_count` segments on the static RF
+    /// connection. Each segment must be credited as soon as it is received,
+    /// and the payload must be forwarded once, when complete.
+    async fn test_segmented_rf_data(rf_state: RfState, segment_count: usize) {
+        let (mut peers, mut nfcc) = setup();
+        nfcc.state.rf_state = rf_state;
+
+        run(&mut nfcc, async {
+            let mut payload = vec![];
+            for index in 1..segment_count {
+                let segment = [index as u8; 255];
+                peers.write_rf_data(INCOMPLETE, &segment).await;
+                assert_eq!(peers.read_nci().await, RF_CREDIT);
+                peers.assert_no_rf_packet();
+                payload.extend(segment);
+            }
+
+            let segment = [0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5];
+            peers.write_rf_data(FINAL, &segment).await;
+            payload.extend(segment);
+
+            assert_eq!(peers.read_rf_data().await, payload);
+            assert_eq!(peers.read_nci().await, RF_CREDIT);
+
+            // No other credit or RF packet is pending.
+            peers.get_config().await;
+            peers.assert_no_rf_packet();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_rf_data_2_segments_poll() {
+        test_segmented_rf_data(ISO_DEP_POLL, 2).await;
+    }
+
+    #[tokio::test]
+    async fn test_rf_data_3_segments_poll() {
+        test_segmented_rf_data(ISO_DEP_POLL, 3).await;
+    }
+
+    #[tokio::test]
+    async fn test_rf_data_2_segments_listen() {
+        test_segmented_rf_data(ISO_DEP_LISTEN, 2).await;
+    }
+
+    #[tokio::test]
+    async fn test_rf_data_3_segments_listen() {
+        test_segmented_rf_data(ISO_DEP_LISTEN, 3).await;
+    }
+
+    #[tokio::test]
+    async fn test_rf_data_interleaved_with_control_command() {
+        let (mut peers, mut nfcc) = setup();
+        nfcc.state.rf_state = ISO_DEP_POLL;
+
+        run(&mut nfcc, async {
+            let expected_response = peers.get_config().await;
+
+            peers.write_rf_data(INCOMPLETE, &[0xa5; 255]).await;
+            assert_eq!(peers.read_nci().await, RF_CREDIT);
+
+            assert_eq!(peers.get_config().await, expected_response);
+            peers.assert_no_rf_packet();
+
+            peers.write_rf_data(FINAL, &[0x5a; 6]).await;
+            assert_eq!(peers.read_rf_data().await, [[0xa5; 255].as_slice(), &[0x5a; 6]].concat());
+            assert_eq!(peers.read_nci().await, RF_CREDIT);
+        })
+        .await;
+    }
+
+    /// Abort a segmented data packet with `command`, activate the RF interface
+    /// again, and check that the next data packet does not include the payload
+    /// of the aborted packet.
+    async fn test_aborted_rf_data(command: &[u8], response_count: usize) {
+        let listen_configuration = vec![nci::DiscoverConfiguration {
+            technology_and_mode: nci::RfTechnologyAndMode::NfcAPassiveListenMode,
+            discovery_frequency: 1,
+        }];
+        let (mut peers, mut nfcc) = setup();
+        nfcc.state.rf_state = RfState::Discovery;
+        nfcc.state.discover_configuration = listen_configuration.clone();
+
+        run(&mut nfcc, async {
+            peers.activate_listen().await;
+            peers.write_rf_data(INCOMPLETE, &[0xa5; 255]).await;
+            assert_eq!(peers.read_nci().await, RF_CREDIT);
+
+            peers.write_nci(command).await;
+            for _ in 0..response_count {
+                let response = peers.read_nci().await;
+                assert_eq!(response[1], command[1], "unexpected opcode");
+            }
+        })
+        .await;
+
+        assert!(!matches!(nfcc.state.rf_state, RfState::ListenActive { .. }));
+        nfcc.state.rf_state = RfState::Discovery;
+        nfcc.state.discover_configuration = listen_configuration;
+
+        run(&mut nfcc, async {
+            peers.activate_listen().await;
+            peers.write_rf_data(FINAL, &[1, 2, 3]).await;
+            assert_eq!(peers.read_rf_data().await, [1, 2, 3]);
+            assert_eq!(peers.read_nci().await, RF_CREDIT);
+            peers.assert_no_rf_packet();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_rf_data_aborted_by_deactivate() {
+        // RF_DEACTIVATE_CMD(Discovery), answered with RF_DEACTIVATE_RSP and
+        // RF_DEACTIVATE_NTF.
+        test_aborted_rf_data(&[0x21, 0x06, 0x01, 0x03], 2).await;
+    }
+
+    #[tokio::test]
+    async fn test_rf_data_aborted_by_reset() {
+        // CORE_RESET_CMD(KeepConfig), answered with CORE_RESET_RSP and
+        // CORE_RESET_NTF.
+        test_aborted_rf_data(&[0x20, 0x00, 0x01, 0x00], 2).await;
+    }
+
+    #[tokio::test]
+    async fn test_segmented_control_command() {
+        let (mut peers, mut nfcc) = setup();
+
+        run(&mut nfcc, async {
+            let expected_response = peers.get_config().await;
+            assert_eq!(expected_response[3], 0x00, "expected STATUS_OK");
+            assert_eq!(expected_response[4], 2, "expected two parameters");
+
+            peers.write_nci(&GET_CONFIG_SEGMENT_1).await;
+            peers.write_nci(&GET_CONFIG_SEGMENT_2).await;
+            assert_eq!(peers.read_nci().await, expected_response);
+
+            // No credit is pending.
+            assert_eq!(peers.get_config().await, expected_response);
+        })
+        .await;
     }
 }
