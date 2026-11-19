@@ -181,6 +181,8 @@ pub enum RfState {
         rf_interface: nci::RfInterfaceType,
         rf_technology: rf::Technology,
         rf_protocol: rf::Protocol,
+        /// NFCEE ID that the last routed SELECT AID command was sent to.
+        selected_route: Option<u8>,
     },
     WaitForHostSelect,
     WaitForSelectResponse {
@@ -253,6 +255,11 @@ pub struct State {
     /// Payload of the segments received so far for an incomplete
     /// Data Message, indexed by Conn ID.
     pub data_segments: [Vec<u8>; 16],
+    /// Listen Mode Routing Table configured by the DH.
+    pub listen_routing_table: Vec<nci::ListenModeRoutingEntry>,
+    /// Entries of a Listen Mode Routing Table that the DH is still sending.
+    pub pending_listen_routing_table: Vec<nci::ListenModeRoutingEntry>,
+    pub power_sub_state: nci::PowerState,
 }
 
 /// State of an NFCC instance.
@@ -696,7 +703,85 @@ fn reassemble(
     }
 }
 
+/// NFCEE ID of the DH in a Listen Mode Routing Table entry.
+const DH_ROUTE: u8 = 0x00;
+
+/// Returns the AID selected by a SELECT by DF name command APDU.
+fn select_aid(apdu: &[u8]) -> Option<&[u8]> {
+    match apdu {
+        [_cla, 0xA4, 0x04, _p2, lc, data @ ..] => data.get(..usize::from(*lc)),
+        _ => None,
+    }
+}
+
 impl State {
+    /// Returns the NFCEE ID that a SELECT command for `aid` received over
+    /// ISO-DEP is routed to, or `None` if the command cannot be routed.
+    ///
+    /// [NCI] 6.3.2 The AID based entries are tried first, then the protocol
+    /// based entry for ISO-DEP. An entry that does not apply to the current
+    /// power state is skipped, unless it blocks routing in that case.
+    fn resolve_aid_route(&self, aid: &[u8]) -> Option<u8> {
+        use nci::ListenModeRoutingEntryType::{AidBasedRouting, ProtocolBasedRouting};
+
+        // The value of an entry is the route, the supported power states, and
+        // the AID or protocol to match.
+        let entries = |r#type| {
+            self.listen_routing_table.iter().filter(move |entry| entry.r#type == r#type).filter_map(
+                |entry| match entry.value.as_slice() {
+                    [route, power_states, value @ ..] => {
+                        Some((entry, *route, *power_states, value))
+                    }
+                    _ => None,
+                },
+            )
+        };
+
+        // Prefer an exact match, then the longest entry that is a prefix of
+        // the selected AID, then an entry that the selected AID is a prefix of.
+        // An entry with an empty AID is the default route for all AIDs.
+        let aid_entry = entries(AidBasedRouting)
+            .filter_map(|candidate| {
+                let (entry, .., entry_aid) = candidate;
+                let enabled = |flag| flag == nci::FeatureFlag::Enabled;
+                let rank = if entry_aid == aid {
+                    (2, 0)
+                } else if aid.starts_with(entry_aid)
+                    && (entry_aid.is_empty() || enabled(entry.match_longer_aids))
+                {
+                    (1, entry_aid.len())
+                } else if entry_aid.starts_with(aid) && enabled(entry.match_shorter_aids) {
+                    (0, 0)
+                } else {
+                    return None;
+                };
+                Some((rank, candidate))
+            })
+            .max_by_key(|(rank, _)| *rank)
+            .map(|(_, candidate)| candidate);
+
+        let iso_dep = [u8::from(nci::RfProtocolType::IsoDep)];
+        let protocol_entry = entries(ProtocolBasedRouting).find(|(.., value)| *value == iso_dep);
+
+        // [NCI] Table 56: Value Field for Power State.
+        let power_state = match self.power_sub_state {
+            nci::PowerState::SwitchedOnState => 0x01,
+            nci::PowerState::SwitchedOnSubstate1 => 0x08,
+            nci::PowerState::SwitchedOnSubstate2 => 0x10,
+            nci::PowerState::SwitchedOnSubstate3 => 0x20,
+        };
+
+        for (entry, route, power_states, _) in aid_entry.into_iter().chain(protocol_entry) {
+            if power_states & power_state != 0 {
+                return Some(route);
+            }
+            if entry.routing_blocked_for_unsupported_power_modes == nci::FeatureFlag::Enabled {
+                return None;
+            }
+        }
+        None
+    }
+
     /// Segments received so far for an incomplete Data Message on the
     /// selected Logical Connection.
     fn data_segments(&mut self, conn_id: nci::ConnId) -> Option<&mut Vec<u8>> {
@@ -806,6 +891,9 @@ impl<'a> Controller<'a> {
                 exit_frames: vec![],
                 command_segments: vec![],
                 data_segments: Default::default(),
+                listen_routing_table: vec![],
+                pending_listen_routing_table: vec![],
+                power_sub_state: nci::PowerState::SwitchedOnState,
             },
         }
     }
@@ -847,6 +935,9 @@ impl<'a> Controller<'a> {
         for segments in &mut self.state.data_segments {
             segments.clear();
         }
+        self.state.listen_routing_table.clear();
+        self.state.pending_listen_routing_table.clear();
+        self.state.power_sub_state = nci::PowerState::SwitchedOnState;
 
         self.send_control(nci::CoreResetResponse { status: nci::Status::Ok }).await?;
 
@@ -1132,6 +1223,7 @@ impl<'a> Controller<'a> {
         info!("[{}] CORE_SET_POWER_SUB_STATE_CMD", self.id);
         info!("         State: {:?}", cmd.power_state());
 
+        self.state.power_sub_state = cmd.power_state();
         self.send_control(nci::CoreSetPowerSubStateResponse { status: nci::Status::Ok }).await?;
 
         Ok(())
@@ -1148,9 +1240,17 @@ impl<'a> Controller<'a> {
 
     async fn rf_set_listen_mode_routing(
         &mut self,
-        _cmd: nci::RfSetListenModeRoutingCommand,
+        cmd: nci::RfSetListenModeRoutingCommand,
     ) -> Result<()> {
         info!("[{}] RF_SET_LISTEN_MODE_ROUTING_CMD", self.id);
+
+        // [NCI] 6.3.2 The routing table can be sent in several commands; it
+        // replaces the current table when the last command is received.
+        self.state.pending_listen_routing_table.extend_from_slice(cmd.routing_entries());
+        if cmd.more_to_follow() == 0 {
+            self.state.listen_routing_table =
+                std::mem::take(&mut self.state.pending_listen_routing_table);
+        }
 
         self.send_control(nci::RfSetListenModeRoutingResponse { status: nci::Status::Ok }).await?;
 
@@ -1166,7 +1266,7 @@ impl<'a> Controller<'a> {
         self.send_control(nci::RfGetListenModeRoutingResponse {
             status: nci::Status::Ok,
             more_to_follow: 0,
-            routing_entries: vec![],
+            routing_entries: self.state.listen_routing_table.clone(),
         })
         .await?;
 
@@ -2081,6 +2181,7 @@ impl<'a> Controller<'a> {
             rf_technology: rf::Technology::NfcA,
             rf_protocol: rf::Protocol::IsoDep,
             rf_interface: nci::RfInterfaceType::IsoDep,
+            selected_route: None,
         };
         self.state.last_rf_received_time = Some(Instant::now());
         self.state.clear_data_segments(nci::ConnId::StaticRf);
@@ -2218,44 +2319,40 @@ impl<'a> Controller<'a> {
             ) if data.sender() == id && data.technology() == rf_technology => {
                 if matches!(self.state.rf_state, RfState::ListenActive { .. }) {
                     let payload = data.data();
+                    let respond = |data| rf::Data {
+                        receiver: id,
+                        sender: self.id,
+                        bitrate: rf::BitRate::BitRate106KbitS,
+                        power_level: 255,
+                        protocol: rf::Protocol::IsoDep,
+                        technology: rf_technology,
+                        data,
+                    };
 
-                    // Autonomous NFCC T4T Presence Check / NDEF probe fast-path
-                    let is_gesture_exchange = payload.len() >= 11
-                        && payload.starts_with(&[0x00, 0xA4, 0x04, 0x00])
-                        && payload
-                            .get(5..)
-                            .is_some_and(|s| s.starts_with(&[0xA0, 0x00, 0x00, 0x04, 0x76, 0x09]));
+                    // An empty frame is a presence check of the ISO-DEP link.
+                    // It is answered by the NFCC and never sent to the DH.
+                    if payload.is_empty() {
+                        self.state.last_rf_received_time = Some(Instant::now());
+                        self.send_rf(respond(vec![]))?;
+                        return Ok(());
+                    }
 
-                    if !is_gesture_exchange {
-                        if payload.starts_with(&[0x00, 0xA4, 0x04, 0x00, 0x07, 0xD2, 0x76])
-                            || payload.starts_with(&[0x00, 0xA4, 0x00])
-                            || payload.starts_with(&[0x00, 0xB0])
-                        {
+                    // [NCI] 6.3.2 A SELECT AID command is routed with the
+                    // Listen Mode Routing Table. All other commands follow
+                    // the last routed SELECT AID command.
+                    if let Some(aid) = select_aid(payload) {
+                        // Only the DH can be reached: NFCEEs are not emulated.
+                        if self.state.resolve_aid_route(aid) != Some(DH_ROUTE) {
+                            info!("[{}] no route to the DH for AID {:02x?}", self.id, aid);
                             self.state.last_rf_received_time = Some(Instant::now());
-                            self.send_rf(rf::Data {
-                                receiver: id,
-                                sender: self.id,
-                                bitrate: rf::BitRate::BitRate106KbitS,
-                                power_level: 255,
-                                protocol: rf::Protocol::IsoDep,
-                                technology: rf_technology,
-                                data: vec![0x6A, 0x82],
-                            })?;
+                            // File or application not found.
+                            self.send_rf(respond(vec![0x6A, 0x82]))?;
                             return Ok(());
                         }
-
-                        if payload.is_empty() {
-                            self.state.last_rf_received_time = Some(Instant::now());
-                            self.send_rf(rf::Data {
-                                receiver: id,
-                                sender: self.id,
-                                bitrate: rf::BitRate::BitRate106KbitS,
-                                power_level: 255,
-                                protocol: rf::Protocol::IsoDep,
-                                technology: rf_technology,
-                                data: vec![],
-                            })?;
-                            return Ok(());
+                        if let RfState::ListenActive { selected_route, .. } =
+                            &mut self.state.rf_state
+                        {
+                            *selected_route = Some(DH_ROUTE);
                         }
                     }
                 }
@@ -2747,6 +2844,9 @@ mod tests {
             exit_frames: vec![],
             command_segments: vec![],
             data_segments: Default::default(),
+            listen_routing_table: vec![],
+            pending_listen_routing_table: vec![],
+            power_sub_state: nci::PowerState::SwitchedOnState,
         }
     }
 
@@ -3450,6 +3550,7 @@ mod tests {
         rf_interface: nci::RfInterfaceType::IsoDep,
         rf_technology: rf::Technology::NfcA,
         rf_protocol: rf::Protocol::IsoDep,
+        selected_route: None,
     };
 
     /// The Device Host and the remote RF endpoint connected to the tested
@@ -3705,5 +3806,266 @@ mod tests {
             assert_eq!(peers.get_config().await, expected_response);
         })
         .await;
+    }
+
+    // Listen Mode Routing.
+
+    const NDEF_AID: [u8; 7] = [0xD2, 0x76, 0x00, 0x00, 0x85, 0x01, 0x01];
+    const GESTURE_EXCHANGE_AID: [u8; 6] = [0xA0, 0x00, 0x00, 0x04, 0x76, 0x09];
+    const SELECT_FILE: [u8; 7] = [0x00, 0xA4, 0x00, 0x0C, 0x02, 0xE1, 0x03];
+    const READ_BINARY: [u8; 5] = [0x00, 0xB0, 0x00, 0x00, 0x0F];
+    const NOT_FOUND: [u8; 2] = [0x6A, 0x82];
+    /// Power State value of a routing entry that only applies when the
+    /// device is switched on.
+    const SWITCHED_ON: u8 = 0x01;
+
+    fn routing_entry(
+        r#type: nci::ListenModeRoutingEntryType,
+        route: u8,
+        power_states: u8,
+        value: &[u8],
+    ) -> nci::ListenModeRoutingEntry {
+        nci::ListenModeRoutingEntry {
+            r#type,
+            match_longer_aids: nci::FeatureFlag::Disabled,
+            match_shorter_aids: nci::FeatureFlag::Disabled,
+            routing_blocked_for_unsupported_power_modes: nci::FeatureFlag::Disabled,
+            value: [&[route, power_states], value].concat(),
+        }
+    }
+
+    fn aid_entry(route: u8, aid: &[u8]) -> nci::ListenModeRoutingEntry {
+        routing_entry(nci::ListenModeRoutingEntryType::AidBasedRouting, route, SWITCHED_ON, aid)
+    }
+
+    fn iso_dep_entry(route: u8, power_states: u8) -> nci::ListenModeRoutingEntry {
+        let iso_dep = u8::from(nci::RfProtocolType::IsoDep);
+        let r#type = nci::ListenModeRoutingEntryType::ProtocolBasedRouting;
+        routing_entry(r#type, route, power_states, &[iso_dep])
+    }
+
+    fn select(aid: &[u8]) -> Vec<u8> {
+        [&[0x00, 0xA4, 0x04, 0x00, aid.len() as u8], aid, &[0x00]].concat()
+    }
+
+    /// Encode a control packet as it is sent on the NCI transport.
+    fn encode(
+        packet: impl TryInto<nci::ControlPacket, Error = pdl_runtime::EncodeError>,
+    ) -> Vec<u8> {
+        let mut bytes = packet.try_into().unwrap().encode_to_vec().unwrap();
+        // The payload length is set by the NCI writer, not by the encoder.
+        bytes[2] = (bytes.len() - 3) as u8;
+        bytes
+    }
+
+    fn routing_response(routing_entries: &[nci::ListenModeRoutingEntry]) -> Vec<u8> {
+        encode(nci::RfGetListenModeRoutingResponse {
+            status: nci::Status::Ok,
+            more_to_follow: 0,
+            routing_entries: routing_entries.to_vec(),
+        })
+    }
+
+    impl Peers {
+        async fn set_routing(
+            &mut self,
+            more_to_follow: u8,
+            routing_entries: &[nci::ListenModeRoutingEntry],
+        ) {
+            self.write_nci(&encode(nci::RfSetListenModeRoutingCommand {
+                more_to_follow,
+                routing_entries: routing_entries.to_vec(),
+            }))
+            .await;
+            assert_eq!(
+                self.read_nci().await,
+                encode(nci::RfSetListenModeRoutingResponse { status: nci::Status::Ok })
+            );
+        }
+
+        async fn get_routing(&mut self) -> Vec<u8> {
+            self.write_nci(&encode(nci::RfGetListenModeRoutingCommand {})).await;
+            self.read_nci().await
+        }
+
+        /// Send an ISO-DEP frame from the RF endpoint to the controller.
+        fn send_rf_data(&mut self, data: &[u8]) {
+            let packet: rf::RfPacket = rf::Data {
+                sender: PEER_ID,
+                receiver: NFCC_ID,
+                technology: rf::Technology::NfcA,
+                protocol: rf::Protocol::IsoDep,
+                bitrate: rf::BitRate::BitRate106KbitS,
+                power_level: 255,
+                data: data.to_vec(),
+            }
+            .try_into()
+            .unwrap();
+            self.rf_tx.send(packet).unwrap();
+        }
+
+        /// Send `apdu` from the RF endpoint, and check that the DH receives it
+        /// and that the controller does not answer it.
+        async fn expect_forwarded(&mut self, apdu: &[u8]) {
+            self.send_rf_data(apdu);
+            assert_eq!(self.read_nci().await, [&[0x00, 0x00, apdu.len() as u8], apdu].concat());
+            self.assert_no_rf_packet();
+        }
+
+        /// Send `data` from the RF endpoint, and check that the controller
+        /// answers it with `response` without sending anything to the DH.
+        async fn expect_answered(&mut self, data: &[u8], response: &[u8]) {
+            self.send_rf_data(data);
+            assert_eq!(self.read_rf_data().await, response);
+            // The next packet received by the DH is the response to its
+            // command.
+            self.get_config().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_listen_mode_routing_roundtrip() {
+        let (mut peers, mut nfcc) = setup();
+        let first = [aid_entry(DH_ROUTE, &NDEF_AID), aid_entry(DH_ROUTE, &GESTURE_EXCHANGE_AID)];
+        let second = [iso_dep_entry(DH_ROUTE, SWITCHED_ON)];
+
+        run(&mut nfcc, async {
+            assert_eq!(peers.get_routing().await, routing_response(&[]));
+
+            // The table is not replaced until the last command is received.
+            peers.set_routing(1, &first).await;
+            assert_eq!(peers.get_routing().await, routing_response(&[]));
+            peers.set_routing(0, &second).await;
+            assert_eq!(
+                peers.get_routing().await,
+                routing_response(&[first.as_slice(), &second].concat())
+            );
+
+            // A new table replaces the previous one.
+            peers.set_routing(0, &second).await;
+            assert_eq!(peers.get_routing().await, routing_response(&second));
+        })
+        .await;
+    }
+
+    /// A Type 4 Tag session routed to the DH: the SELECT AID command and the
+    /// commands that follow it are all sent to the DH.
+    async fn test_ndef_session_forwarded(routing_table: &[nci::ListenModeRoutingEntry]) {
+        let (mut peers, mut nfcc) = setup();
+        nfcc.state.rf_state = ISO_DEP_LISTEN;
+
+        run(&mut nfcc, async {
+            peers.set_routing(0, routing_table).await;
+            peers.expect_forwarded(&select(&NDEF_AID)).await;
+            peers.expect_forwarded(&SELECT_FILE).await;
+            peers.expect_forwarded(&READ_BINARY).await;
+        })
+        .await;
+
+        assert!(matches!(
+            nfcc.state.rf_state,
+            RfState::ListenActive { selected_route: Some(DH_ROUTE), .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_ndef_session_forwarded_with_aid_route() {
+        test_ndef_session_forwarded(&[aid_entry(DH_ROUTE, &NDEF_AID)]).await;
+    }
+
+    #[tokio::test]
+    async fn test_ndef_session_forwarded_with_iso_dep_route() {
+        test_ndef_session_forwarded(&[iso_dep_entry(DH_ROUTE, SWITCHED_ON)]).await;
+    }
+
+    #[tokio::test]
+    async fn test_gesture_exchange_forwarded() {
+        let (mut peers, mut nfcc) = setup();
+        nfcc.state.rf_state = ISO_DEP_LISTEN;
+
+        run(&mut nfcc, async {
+            peers.set_routing(0, &[aid_entry(DH_ROUTE, &GESTURE_EXCHANGE_AID)]).await;
+            peers.expect_forwarded(&select(&GESTURE_EXCHANGE_AID)).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_unrouted_select_aid_not_found() {
+        let (mut peers, mut nfcc) = setup();
+        nfcc.state.rf_state = ISO_DEP_LISTEN;
+
+        run(&mut nfcc, async {
+            // Without routing table.
+            peers.expect_answered(&select(&NDEF_AID), &NOT_FOUND).await;
+
+            // Without AID entry for the selected AID or ISO-DEP entry.
+            peers.set_routing(0, &[aid_entry(DH_ROUTE, &GESTURE_EXCHANGE_AID)]).await;
+            peers.expect_answered(&select(&NDEF_AID), &NOT_FOUND).await;
+        })
+        .await;
+
+        assert_eq!(nfcc.state.rf_state, ISO_DEP_LISTEN);
+    }
+
+    #[tokio::test]
+    async fn test_empty_frame_answered_by_controller() {
+        let (mut peers, mut nfcc) = setup();
+        nfcc.state.rf_state = ISO_DEP_LISTEN;
+
+        run(&mut nfcc, async {
+            peers.set_routing(0, &[iso_dep_entry(DH_ROUTE, SWITCHED_ON)]).await;
+            peers.expect_answered(&[], &[]).await;
+        })
+        .await;
+    }
+
+    #[test]
+    fn test_resolve_aid_route() {
+        use nci::FeatureFlag::Enabled;
+        let mut state = create_test_state();
+        let longer_aid = [NDEF_AID.as_slice(), &[0xFF]].concat();
+
+        state.listen_routing_table = vec![
+            aid_entry(3, &GESTURE_EXCHANGE_AID),
+            nci::ListenModeRoutingEntry {
+                match_longer_aids: Enabled,
+                ..aid_entry(1, &NDEF_AID[..5])
+            },
+            nci::ListenModeRoutingEntry {
+                match_shorter_aids: Enabled,
+                ..aid_entry(2, &longer_aid)
+            },
+            iso_dep_entry(4, SWITCHED_ON),
+        ];
+        assert_eq!(state.resolve_aid_route(&GESTURE_EXCHANGE_AID), Some(3), "exact match");
+        assert_eq!(state.resolve_aid_route(&NDEF_AID[..5]), Some(1), "exact match");
+        assert_eq!(state.resolve_aid_route(&NDEF_AID), Some(1), "entry is a prefix");
+        assert_eq!(state.resolve_aid_route(&NDEF_AID[..4]), Some(2), "entry is longer");
+        assert_eq!(state.resolve_aid_route(&[1, 2, 3]), Some(4), "ISO-DEP route");
+
+        // Partial matches are not allowed by default.
+        state.listen_routing_table = vec![aid_entry(1, &NDEF_AID[..5]), aid_entry(2, &longer_aid)];
+        assert_eq!(state.resolve_aid_route(&NDEF_AID), None);
+
+        // An entry with an empty AID is the default AID route.
+        state.listen_routing_table = vec![aid_entry(5, &[])];
+        assert_eq!(state.resolve_aid_route(&NDEF_AID), Some(5));
+
+        // The AID entry does not apply when the screen is off and locked
+        // (Switched On Sub-State 3), but the ISO-DEP entry does.
+        state.power_sub_state = nci::PowerState::SwitchedOnSubstate3;
+        state.listen_routing_table = vec![aid_entry(1, &NDEF_AID), iso_dep_entry(4, 0x20)];
+        assert_eq!(state.resolve_aid_route(&NDEF_AID), Some(4));
+
+        // Unless the AID entry blocks routing in unsupported power states.
+        state.listen_routing_table = vec![
+            nci::ListenModeRoutingEntry {
+                routing_blocked_for_unsupported_power_modes: Enabled,
+                ..aid_entry(1, &NDEF_AID)
+            },
+            iso_dep_entry(4, 0x20),
+        ];
+        assert_eq!(state.resolve_aid_route(&NDEF_AID), None);
     }
 }
