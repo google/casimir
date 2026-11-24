@@ -871,31 +871,35 @@ impl<'a> Controller<'a> {
     async fn core_set_config(&mut self, cmd: nci::CoreSetConfigCommand) -> Result<()> {
         info!("[{}] CORE_SET_CONFIG_CMD", self.id);
 
-        let mut invalid_parameters = vec![];
-        for parameter in cmd.parameters() {
-            info!("         Type: {:?}", parameter.id);
-            info!("         Value: {:?}", parameter.value);
-            match parameter.id {
-                nci::ConfigParameterId::Rfu(_) => invalid_parameters.push(parameter.id),
-                // TODO(henrichataing):
-                // [NCI] 5.2.1 State RFST_IDLE
-                // Unless otherwise specified, discovery related configuration
-                // defined in Sections 6.1, 6.2, 6.3 and 7.1 SHALL only be set
-                // while in IDLE state.
-                //
-                // Respond with Semantic Error as indicated by
-                // [NCI] 3.2.2 Exception Handling for Control Messages
-                // An unexpected Command SHALL NOT cause any action by the NFCC.
-                // Unless otherwise specified, the NFCC SHALL send a Response
-                // with a Status value of STATUS_SEMANTIC_ERROR and no
-                // additional fields.
-                _ => {
-                    if self.state.config_parameters.set(parameter.id, &parameter.value).is_err() {
-                        invalid_parameters.push(parameter.id);
-                    }
+        let invalid_parameters: Vec<_> = cmd
+            .parameters()
+            .iter()
+            .filter_map(|parameter| {
+                info!("         Type: {:?}", parameter.id);
+                info!("         Value: {:?}", parameter.value);
+                match parameter.id {
+                    nci::ConfigParameterId::Rfu(_) => Some(parameter.id),
+                    // TODO(henrichataing):
+                    // [NCI] 5.2.1 State RFST_IDLE
+                    // Unless otherwise specified, discovery related configuration
+                    // defined in Sections 6.1, 6.2, 6.3 and 7.1 SHALL only be set
+                    // while in IDLE state.
+                    //
+                    // Respond with Semantic Error as indicated by
+                    // [NCI] 3.2.2 Exception Handling for Control Messages
+                    // An unexpected Command SHALL NOT cause any action by the NFCC.
+                    // Unless otherwise specified, the NFCC SHALL send a Response
+                    // with a Status value of STATUS_SEMANTIC_ERROR and no
+                    // additional fields.
+                    _ => self
+                        .state
+                        .config_parameters
+                        .set(parameter.id, &parameter.value)
+                        .is_err()
+                        .then_some(parameter.id),
                 }
-            }
-        }
+            })
+            .collect();
 
         self.send_control(nci::CoreSetConfigResponse {
             status: if invalid_parameters.is_empty() {
@@ -924,23 +928,31 @@ impl<'a> Controller<'a> {
     async fn core_config(&mut self, cmd: nci::CoreGetConfigCommand) -> Result<()> {
         info!("[{}] CORE_GET_CONFIG_CMD", self.id);
 
-        let mut valid_parameters = vec![];
-        let mut invalid_parameters = vec![];
-        for id in cmd.parameters() {
-            info!("         ID: {id:?}");
-            match self.state.config_parameters.get(*id) {
-                Ok(value) => {
-                    valid_parameters.push(nci::ConfigParameter { id: *id, value });
-                }
-                Err(_) => invalid_parameters.push(nci::ConfigParameter { id: *id, value: vec![] }),
-            }
-        }
+        let results: Vec<_> = cmd
+            .parameters()
+            .iter()
+            .map(|id| {
+                info!("         ID: {id:?}");
+                (*id, self.state.config_parameters.get(*id).ok())
+            })
+            .collect();
+        let invalid_parameters: Vec<_> = results
+            .iter()
+            .filter(|(_, value)| value.is_none())
+            .map(|(id, _)| nci::ConfigParameter { id: *id, value: vec![] })
+            .collect();
 
         self.send_control(if invalid_parameters.is_empty() {
             // If the NFCC is able to respond with all requested parameters, the
             // NFCC SHALL respond with the CORE_GET_CONFIG_RSP with a Status
             // of STATUS_OK.
-            nci::CoreGetConfigResponse { status: nci::Status::Ok, parameters: valid_parameters }
+            nci::CoreGetConfigResponse {
+                status: nci::Status::Ok,
+                parameters: results
+                    .into_iter()
+                    .filter_map(|(id, value)| value.map(|value| nci::ConfigParameter { id, value }))
+                    .collect(),
+            }
         } else {
             // If the DH tries to retrieve any parameter(s) that are not available
             // in the NFCC, the NFCC SHALL respond with a CORE_GET_CONFIG_RSP with
@@ -1458,33 +1470,33 @@ impl<'a> Controller<'a> {
         info!("[{}] ANDROID_SET_PASSIVE_OBSERVER_EXIT_FRAMES_CMD", self.id);
 
         if self.state.rf_state == RfState::Idle || self.state.rf_state == RfState::Discovery {
-            self.state.exit_frames.clear();
             self.state.exit_frame_timeout =
                 Duration::from_millis(u64::from(u16::from_le(cmd.timeout())));
-            let exit_frame_count = cmd.exit_frames().len();
-            info!("number of exit frames {exit_frame_count:?}");
             let incoming_frames = cmd.exit_frames();
-            for frame in incoming_frames {
-                let Some((&power_states, rest)) = frame.field_value.split_first() else {
-                    anyhow::bail!("empty exit frame field_value");
-                };
-                let data_length = rest.len() / 2;
-                let (data_slice, mask_slice) = rest.split_at(data_length);
+            info!("number of exit frames {}", incoming_frames.len());
+            self.state.exit_frames = incoming_frames
+                .iter()
+                .map(|frame| {
+                    let Some((&power_states, rest)) = frame.field_value.split_first() else {
+                        anyhow::bail!("empty exit frame field_value");
+                    };
+                    let (data_slice, mask_slice) = rest.split_at(rest.len() / 2);
 
-                let exit_frame = RfExitFrame {
-                    power_states,
-                    data: data_slice.to_vec(),
-                    mask: mask_slice.to_vec(),
-                    rf_technology: rf::Technology::from_u8(
-                        frame.qualifier_type & EXIT_FRAME_QUALIFIER_TECHNOLOGY_MASK,
-                    ),
-                    is_prefix_matching_allowed: frame.qualifier_type
-                        & EXIT_FRAME_QUALIFIER_PREFIX_MATCHING_MASK
-                        != 0,
-                };
-                info!("Added exit frame {exit_frame:?}");
-                self.state.exit_frames.push(exit_frame);
-            }
+                    let exit_frame = RfExitFrame {
+                        power_states,
+                        data: data_slice.to_vec(),
+                        mask: mask_slice.to_vec(),
+                        rf_technology: rf::Technology::from_u8(
+                            frame.qualifier_type & EXIT_FRAME_QUALIFIER_TECHNOLOGY_MASK,
+                        ),
+                        is_prefix_matching_allowed: frame.qualifier_type
+                            & EXIT_FRAME_QUALIFIER_PREFIX_MATCHING_MASK
+                            != 0,
+                    };
+                    info!("Added exit frame {exit_frame:?}");
+                    Ok(exit_frame)
+                })
+                .collect::<Result<Vec<_>>>()?;
 
             self.send_control(nci::AndroidSetPassiveObserverExitFrameResponse {
                 status: nci::Status::Ok,
@@ -2054,14 +2066,16 @@ impl<'a> Controller<'a> {
         // [DIGITAL] 14.6.2 RATS Response (Answer To Select)
         // Construct the response from the values passed in the configuration
         // parameters. The TL byte is excluded from the response.
-        let mut rats_response = vec![
-            0x78, // TC(1), TB(1), TA(1) transmitted, FSCI=8
-            0x80, // TA(1)
-            self.state.config_parameters.li_a_rats_tb1,
-            self.state.config_parameters.li_a_rats_tc1,
-        ];
-
-        rats_response.extend_from_slice(&self.state.config_parameters.li_a_hist_by);
+        let rats_response = [
+            &[
+                0x78, // TC(1), TB(1), TA(1) transmitted, FSCI=8
+                0x80, // TA(1)
+                self.state.config_parameters.li_a_rats_tb1,
+                self.state.config_parameters.li_a_rats_tc1,
+            ],
+            self.state.config_parameters.li_a_hist_by.as_slice(),
+        ]
+        .concat();
 
         self.send_rf(rf::IsoDepT4ATSelectResponse {
             receiver: cmd.sender(),
@@ -2131,8 +2145,8 @@ impl<'a> Controller<'a> {
         // Save the activation parameters for the RF frame interface
         // implementation. Note: TL is not included in the RATS response
         // and needs to be added manually to the activation parameters.
-        self.state.rf_activation_parameters = vec![u8::try_from(cmd.rats_response().len())?];
-        self.state.rf_activation_parameters.extend_from_slice(cmd.rats_response());
+        self.state.rf_activation_parameters =
+            [&[u8::try_from(cmd.rats_response().len())?], cmd.rats_response().as_slice()].concat();
 
         info!("[{}] RF_INTF_ACTIVATED_NTF", self.id);
         info!("         DiscoveryID: {:?}", nci::RfDiscoveryId::from_index(rf_discovery_id));
