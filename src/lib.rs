@@ -28,7 +28,7 @@ use anyhow::Result;
 use log::warn;
 use pdl_runtime::Packet;
 use std::future::Future;
-use std::pin::{pin, Pin};
+use std::pin::{Pin, pin};
 use std::task::Context;
 use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -220,12 +220,12 @@ impl Default for Scene {
 impl Scene {
     /// Create a new empty scene.
     pub fn new() -> Scene {
-        Default::default()
+        Scene::default()
     }
 
     fn wake(&mut self) {
         if let Some(waker) = self.waker.take() {
-            waker.wake()
+            waker.wake();
         }
     }
 
@@ -239,7 +239,7 @@ impl Scene {
                 *slot = Some(builder(self.next_id, self.rf_tx.clone()));
                 self.next_id += 1;
                 self.wake();
-                return Ok(n as Id);
+                return Ok(Id::try_from(n)?);
             }
         }
         Err(anyhow::anyhow!("max number of connections reached"))
@@ -315,7 +315,7 @@ impl Future for Scene {
             };
 
             if dropped {
-                self.disconnect(n)
+                self.disconnect(n);
             }
         }
         self.waker = Some(cx.waker().clone());

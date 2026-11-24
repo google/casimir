@@ -39,10 +39,10 @@ use tokio::sync::mpsc;
 
 mod proto;
 
-use ::casimir::packets::rf;
 use ::casimir::Device as CasimirDevice;
 use ::casimir::Id;
 use ::casimir::MAX_DEVICES;
+use ::casimir::packets::rf;
 use proto::{casimir, casimir_grpc};
 
 /// Identify the device type.
@@ -78,12 +78,12 @@ impl Scene {
 
     fn wake(&mut self) {
         if let Some(waker) = self.waker.take() {
-            waker.wake()
+            waker.wake();
         }
     }
 
     fn add_device(&mut self, builder: impl FnOnce(Id) -> CasimirDevice) -> Result<Id> {
-        for slot in self.devices.iter_mut() {
+        for slot in &mut self.devices {
             if slot.is_none() {
                 let id = self.next_id;
                 *slot = Some(builder(id));
@@ -157,7 +157,7 @@ impl Future for Scene {
                 None => false,
             };
             if dropped {
-                self.disconnect(n)
+                self.disconnect(n);
             }
         }
         self.waker = Some(cx.waker().clone());
@@ -176,8 +176,8 @@ impl From<&DeviceInformation> for casimir::Device {
         device.set_device_id(u32::from(info.id));
         device.set_position(info.position);
         match info.r#type {
-            DeviceType::Nci => device.set_nci(Default::default()),
-            DeviceType::Rf => device.set_rf(Default::default()),
+            DeviceType::Nci => device.set_nci(casimir::Device_Nci::default()),
+            DeviceType::Rf => device.set_rf(casimir::Device_Rf::default()),
         }
         device
     }
@@ -203,7 +203,8 @@ impl casimir_grpc::Casimir for Service {
         req: casimir::GetDeviceRequest,
         sink: grpcio::UnarySink<casimir::GetDeviceResponse>,
     ) {
-        match self.context.lock().get(&(req.get_device_id() as u16)) {
+        let context = self.context.lock();
+        match u16::try_from(req.get_device_id()).ok().and_then(|id| context.get(&id)) {
             Some(info) => {
                 let mut response = casimir::GetDeviceResponse::new();
                 response.set_device(info.into());
@@ -222,10 +223,11 @@ impl casimir_grpc::Casimir for Service {
         req: casimir::MoveDeviceRequest,
         sink: grpcio::UnarySink<casimir::MoveDeviceResponse>,
     ) {
-        match self.context.lock().get_mut(&(req.get_device_id() as u16)) {
+        let mut context = self.context.lock();
+        match u16::try_from(req.get_device_id()).ok().and_then(|id| context.get_mut(&id)) {
             Some(info) => {
                 info.position = req.get_position();
-                sink.success(Default::default())
+                sink.success(casimir::MoveDeviceResponse::default())
             }
             None => sink.fail(grpcio::RpcStatus::with_message(
                 grpcio::RpcStatusCode::INVALID_ARGUMENT,
@@ -238,15 +240,15 @@ impl casimir_grpc::Casimir for Service {
 #[derive(FromArgs, Debug)]
 /// Nfc emulator.
 struct Opt {
-    #[argh(option, default = "7000")]
+    #[argh(option, long = "nci-port", default = "7000")]
     /// configure the TCP port for the NCI server.
-    nci_port: u16,
-    #[argh(option, default = "7001")]
+    nci: u16,
+    #[argh(option, long = "rf-port", default = "7001")]
     /// configure the TCP port for the RF server.
-    rf_port: u16,
-    #[argh(option, default = "50051")]
+    rf: u16,
+    #[argh(option, long = "grpc-port", default = "50051")]
     /// configure the gRPC port.
-    grpc_port: u16,
+    grpc: u16,
 }
 
 async fn run() -> Result<()> {
@@ -255,16 +257,14 @@ async fn run() -> Result<()> {
     );
 
     let opt: Opt = argh::from_env();
-    let nci_listener =
-        TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, opt.nci_port)).await?;
-    let rf_listener =
-        TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, opt.rf_port)).await?;
+    let nci_listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, opt.nci)).await?;
+    let rf_listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, opt.rf)).await?;
     let (rf_tx, mut rf_rx) = mpsc::unbounded_channel();
     let mut scene = Scene::new();
 
-    info!("Listening for NCI connections at address 127.0.0.1:{}", opt.nci_port);
-    info!("Listening for RF connections at address 127.0.0.1:{}", opt.rf_port);
-    info!("Listening for gRPC connections at address 127.0.0.1:{}", opt.grpc_port);
+    info!("Listening for NCI connections at address 127.0.0.1:{}", opt.nci);
+    info!("Listening for RF connections at address 127.0.0.1:{}", opt.rf);
+    info!("Listening for gRPC connections at address 127.0.0.1:{}", opt.grpc);
 
     let env = std::sync::Arc::new(grpcio::Environment::new(1));
     let service = casimir_grpc::create_casimir(Service { context: scene.context.clone() });
@@ -276,7 +276,7 @@ async fn run() -> Result<()> {
         .channel_args(channel_builder.build_args())
         .build()?;
     server.add_listening_port(
-        format!("127.0.0.1:{}", opt.grpc_port),
+        format!("127.0.0.1:{}", opt.grpc),
         grpcio::ServerCredentials::insecure(),
     )?;
     server.start();
@@ -292,7 +292,7 @@ async fn run() -> Result<()> {
                         scene.context.lock().insert(id, DeviceInformation {
                             id, position: u32::from(id), r#type: DeviceType::Nci
                         });
-                        info!("Accepted NCI connection from {addr} with id {id}")
+                        info!("Accepted NCI connection from {addr} with id {id}");
                     }
                     Err(err) => error!("Failed to accept NCI connection from {addr}: {err}")
                 }
@@ -306,15 +306,15 @@ async fn run() -> Result<()> {
                         scene.context.lock().insert(id, DeviceInformation {
                             id, position: u32::from(id), r#type: DeviceType::Rf
                         });
-                        info!("Accepted RF connection from {addr} with id {id}")
+                        info!("Accepted RF connection from {addr} with id {id}");
                     }
                     Err(err) => error!("Failed to accept RF connection from {addr}: {err}")
                 }
             },
-            _ = &mut scene => (),
+            () = &mut scene => (),
             result = rf_rx.recv() => {
                 let packet = result.ok_or(anyhow::anyhow!("rf_rx channel closed"))?;
-                scene.send(&packet)?
+                scene.send(&packet)?;
             }
         }
     }

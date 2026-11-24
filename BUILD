@@ -32,7 +32,7 @@ rust_library(
         ":casimir_rf_packets_rust_gen",
     ],
     crate_name = "casimir",
-    edition = "2021",
+    edition = "2024",
     rustc_env = {
         "OUT_DIR": "..",
     },
@@ -49,7 +49,7 @@ rust_library(
 rust_binary(
     name = "casimir",
     srcs = ["src/main.rs"],
-    edition = "2021",
+    edition = "2024",
     deps = [
         ":casimir_lib",
         "@anyhow",
