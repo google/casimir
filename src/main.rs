@@ -143,7 +143,7 @@ async fn run() -> Result<()> {
                     Err(err) => error!("Failed to accept RF connection from {addr}: {err}")
                 }
             },
-            _ = &mut scene => (),
+            () = &mut scene => (),
         }
     }
 }

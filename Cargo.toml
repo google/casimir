@@ -1,7 +1,8 @@
 [package]
 name = "casimir"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.88"
 default-run = "casimir"
 
 [lib]
@@ -45,16 +46,18 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("serde"))'
 unsafe_code = "deny"
 
 [lints.clippy]
-cast_lossless = "warn"
+pedantic = { level = "deny", priority = -1 }
+
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"
+
 indexing_slicing = "deny"
-manual_let_else = "warn"
-map_unwrap_or = "warn"
-match_same_arms = "warn"
-needless_for_each = "warn"
 panic = "deny"
 panic_in_result_fn = "deny"
 todo = "deny"
 unimplemented = "deny"
 unreachable = "deny"
-unreadable_literal = "warn"
 unwrap_used = "deny"
